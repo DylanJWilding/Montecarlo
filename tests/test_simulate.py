@@ -169,3 +169,68 @@ def test_unknown_mode_raises_error():
 def test_missing_values_raise_error():
     with pytest.raises(SimulationError):
         run_simulation([100.0, np.nan, 50.0], STARTING_BALANCE)
+
+
+# ---------------------------------------------------------------------------
+# Compounding mode
+#
+# Needed for strategies that size positions as a percentage of the account,
+# where a trade's monetary result depends on the balance at the time and so
+# cannot be transplanted to a different point in a different sequence.
+# ---------------------------------------------------------------------------
+
+from simulate import to_returns
+
+RETURNS = np.array([0.10, -0.05, 0.20, -0.025, 0.075])
+
+
+def test_compounding_multiplies_rather_than_adds():
+    curve = equity_curve(RETURNS, 1000.0, compound=True)
+    # 1000 * 1.10 * 0.95 * 1.20 * 0.975 * 1.075
+    assert curve[-1] == pytest.approx(1000 * 1.10 * 0.95 * 1.20 * 0.975 * 1.075)
+
+
+def test_compounded_simulation_has_expected_shape():
+    paths = run_simulation(RETURNS, 1000.0, n_simulations=50, seed=1, compound=True)
+    assert paths.shape == (50, len(RETURNS))
+
+
+def test_compounded_reshuffle_ends_at_same_balance():
+    """
+    Multiplication is commutative, so reordering compounded returns cannot
+    change the final balance, just as addition cannot for fixed amounts.
+    """
+    paths = run_simulation(
+        RETURNS, 1000.0, n_simulations=100,
+        mode=WITHOUT_REPLACEMENT, seed=1, compound=True,
+    )
+    expected = 1000.0 * np.prod(1 + RETURNS)
+    assert np.allclose(paths[:, -1], expected)
+
+
+def test_compounding_and_adding_give_different_results():
+    added = run_simulation(RETURNS, 1000.0, n_simulations=20, seed=3, compound=False)
+    compounded = run_simulation(RETURNS, 1000.0, n_simulations=20, seed=3, compound=True)
+    assert not np.allclose(added, compounded)
+
+
+def test_to_returns_recovers_the_fraction_risked():
+    profits = np.array([100.0, -55.0])
+    balances = np.array([1100.0, 1045.0])   # 1000 -> 1100 -> 1045
+    assert to_returns(profits, balances) == pytest.approx([0.10, -0.05])
+
+
+def test_to_returns_round_trips_through_compounding():
+    """
+    Converting a real balance history to returns and compounding them back
+    must reproduce the original final balance.
+    """
+    profits = np.array([100.0, -55.0, 209.0])
+    balances = np.array([1100.0, 1045.0, 1254.0])
+    returns = to_returns(profits, balances)
+    assert equity_curve(returns, 1000.0, compound=True)[-1] == pytest.approx(1254.0)
+
+
+def test_to_returns_rejects_mismatched_lengths():
+    with pytest.raises(SimulationError):
+        to_returns(np.array([100.0, 50.0]), np.array([1100.0]))

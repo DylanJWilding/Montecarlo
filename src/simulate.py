@@ -41,6 +41,7 @@ def run_simulation(
     n_simulations=DEFAULT_SIMULATIONS,
     mode=WITH_REPLACEMENT,
     seed=None,
+    compound=False,
 ):
     """
     Generate simulated equity paths by resampling the trade sequence.
@@ -51,6 +52,13 @@ def run_simulation(
         n_simulations: number of alternative paths to generate.
         mode: WITH_REPLACEMENT or WITHOUT_REPLACEMENT.
         seed: optional integer. Supplying one makes the run reproducible.
+        compound: whether the values supplied are fractional returns to be
+            compounded (True) or fixed monetary amounts to be added (False).
+            Use True whenever the strategy sizes its positions as a
+            percentage of the account, because in that case a trade's
+            monetary value depends on the balance at the time it was taken
+            and cannot meaningfully be transplanted to a different point in
+            a different sequence. See the note on _accumulate below.
 
     Returns:
         A 2D numpy array of shape (n_simulations, n_trades) where each row is
@@ -71,14 +79,59 @@ def run_simulation(
 
     resampled = _resample(profits, n_simulations, mode, rng)
 
-    # Each path is the running total of its own resampled trades, offset by
-    # the opening balance. Doing this with a cumulative sum across the whole
-    # array at once is far faster than looping over each simulation, which
-    # matters because this is the performance bottleneck (NFR1).
+    return _accumulate(resampled, starting_balance, compound)
+
+
+def _accumulate(resampled, starting_balance, compound):
+    """
+    Turn resampled trade outcomes into equity paths.
+
+    Two accumulation methods are needed because the two position sizing
+    regimes produce different kinds of number.
+
+    Under fixed monetary risk every trade stakes roughly the same amount
+    regardless of the balance, so a trade's result is a sum of money that
+    means the same thing anywhere in the sequence. Those are added.
+
+    Under percentage risk the amount staked scales with the account, so a
+    given trade's monetary result is only meaningful relative to the balance
+    at the time. Moving a large late-sequence loss to the start of a path
+    would apply a loss that could never have occurred at that balance. The
+    trade is therefore expressed as a fraction of the account and compounded,
+    which preserves its meaning wherever it lands.
+
+    Both are computed across the whole array at once rather than per
+    simulation, for the performance reasons noted above (NFR1).
+    """
+    if compound:
+        return starting_balance * np.cumprod(1.0 + resampled, axis=1)
+
     return starting_balance + np.cumsum(resampled, axis=1)
 
 
-def equity_curve(profits, starting_balance):
+def to_returns(profits, balances):
+    """
+    Express each trade as a fraction of the account balance before it.
+
+    Needed to simulate a strategy that sizes positions as a percentage of
+    equity. The balance before a trade is recovered by subtracting that
+    trade's result from the balance recorded against it.
+    """
+    profits = np.asarray(profits, dtype=float)
+    balances = np.asarray(balances, dtype=float)
+
+    if profits.shape != balances.shape:
+        raise SimulationError("Profits and balances must be the same length")
+
+    equity_before = balances - profits
+
+    if (equity_before <= 0).any():
+        raise SimulationError("Account balance reached zero or below")
+
+    return profits / equity_before
+
+
+def equity_curve(profits, starting_balance, compound=False):
     """
     Build the actual historical equity curve, with no resampling.
 
@@ -86,6 +139,10 @@ def equity_curve(profits, starting_balance):
     real result can be positioned within the simulated distribution (FR14).
     """
     profits = _validate_profits(profits)
+
+    if compound:
+        return starting_balance * np.cumprod(1.0 + profits)
+
     return starting_balance + np.cumsum(profits)
 
 
