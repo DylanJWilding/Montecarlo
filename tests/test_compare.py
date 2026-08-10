@@ -172,3 +172,69 @@ def test_comparison_rejects_one_dimensional_input():
     benchmark = buy_and_hold_curve([100.0, 110.0], START)
     with pytest.raises(ComparisonError):
         compare_to_benchmark(np.array([1000.0, 1200.0]), benchmark, START)
+
+
+# ---------------------------------------------------------------------------
+# Risk adjusted measures
+# ---------------------------------------------------------------------------
+
+from compare import sharpe_ratio, returns_from_curve
+
+
+def test_sharpe_is_mean_over_standard_deviation():
+    returns = np.array([0.01, 0.02, 0.03, 0.04])
+    expected = returns.mean() / returns.std(ddof=1)
+    assert sharpe_ratio(returns) == pytest.approx(expected)
+
+
+def test_steadier_returns_score_higher_than_volatile_ones():
+    """
+    The property that makes the Sharpe ratio worth reporting next to the
+    drawdown ratio: both series average the same, but one is far choppier.
+    """
+    steady = np.array([0.018, 0.022, 0.019, 0.021])
+    volatile = np.array([-0.10, 0.14, -0.08, 0.12])
+    assert steady.mean() == pytest.approx(volatile.mean())
+    assert sharpe_ratio(steady) > sharpe_ratio(volatile)
+
+
+def test_constant_positive_returns_are_unbounded():
+    """
+    Matches the treatment of zero drawdown: profit with no variability at all
+    is unbounded rather than zero. The two risk-adjusted measures are
+    reported together so they must handle the degenerate case the same way.
+    """
+    assert np.isinf(sharpe_ratio(np.array([0.02, 0.02, 0.02])))
+
+
+def test_constant_zero_returns_score_nothing():
+    assert sharpe_ratio(np.array([0.0, 0.0, 0.0])) == pytest.approx(0.0)
+
+
+def test_annualising_scales_by_root_of_periods():
+    returns = np.array([0.01, -0.005, 0.02, 0.015])
+    assert sharpe_ratio(returns, periods_per_year=252) == pytest.approx(
+        sharpe_ratio(returns) * np.sqrt(252)
+    )
+
+
+def test_sharpe_computed_per_row_for_many_series():
+    series = np.array([[0.01, 0.02, 0.03], [-0.01, 0.05, -0.02]])
+    assert len(sharpe_ratio(series)) == 2
+
+
+def test_sharpe_needs_at_least_two_returns():
+    with pytest.raises(ComparisonError):
+        sharpe_ratio(np.array([0.01]))
+
+
+def test_returns_recovered_from_a_curve():
+    curve = np.array([1100.0, 1045.0])
+    assert returns_from_curve(curve, 1000.0) == pytest.approx([0.10, -0.05])
+
+
+def test_returns_recovered_per_row_for_many_curves():
+    curves = np.array([[1100.0, 1045.0], [900.0, 990.0]])
+    result = returns_from_curve(curves, 1000.0)
+    assert result.shape == (2, 2)
+    assert result[1] == pytest.approx([-0.10, 0.10])

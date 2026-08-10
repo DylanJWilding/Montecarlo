@@ -185,3 +185,81 @@ def compare_to_benchmark(paths, benchmark_curve, starting_balance):
         "beats_on_return": path_returns > benchmark_return,
         "beats_on_ratio": path_ratios > benchmark_ratio,
     }
+
+
+# Approximate number of trading days in a year, used to annualise.
+TRADING_DAYS_PER_YEAR = 252
+
+
+def sharpe_ratio(returns, periods_per_year=None, risk_free_rate=0.0):
+    """
+    Mean return divided by the standard deviation of returns.
+
+    Where the return-to-drawdown ratio penalises the single worst decline,
+    the Sharpe ratio penalises volatility throughout. The two can disagree: a
+    strategy with consistently choppy returns but no severe decline scores
+    poorly here and well there, so both are worth reporting.
+
+    Annualisation is applied by scaling with the square root of the number of
+    periods per year. Lo (2002) shows that this scaling is only valid when
+    returns are independent and identically distributed, an assumption that
+    real trade sequences frequently violate, so an annualised figure computed
+    this way should be read as an approximation rather than a precise
+    quantity. That caveat is the reason a distribution of outcomes is
+    reported alongside any single summary statistic.
+
+    Args:
+        returns: per-trade or per-period fractional returns. A 2D array is
+            treated as one series per row.
+        periods_per_year: supply to annualise; leave as None for the
+            per-period figure.
+        risk_free_rate: return available without taking risk, expressed per
+            period. Defaults to zero.
+
+    Returns:
+        A float, or one value per row for a 2D input.
+    """
+    returns = np.asarray(returns, dtype=float)
+
+    if returns.shape[-1] < 2:
+        raise ComparisonError("Need at least two returns to compute a Sharpe ratio")
+
+    excess = returns - risk_free_rate
+    mean = excess.mean(axis=-1)
+    # ddof=1 gives the sample standard deviation, appropriate because these
+    # returns are a sample of the strategy's behaviour rather than the whole
+    # population of trades it could ever produce.
+    deviation = excess.std(axis=-1, ddof=1)
+
+    # Zero volatility is handled the same way as zero drawdown above: a
+    # positive return earned with no variability at all is unbounded, while a
+    # flat or losing series earns nothing. Consistency between the two
+    # risk-adjusted measures matters here, since they are reported together.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(
+            deviation > 0,
+            mean / deviation,
+            np.where(mean > 0, np.inf, 0.0),
+        )
+
+    if periods_per_year is not None:
+        ratio = ratio * np.sqrt(periods_per_year)
+
+    return ratio
+
+
+def returns_from_curve(equity, starting_balance):
+    """
+    Recover the per-step fractional returns from an equity curve.
+
+    Lets the risk-adjusted measures be computed for simulated paths, which
+    are produced as balances rather than as returns.
+    """
+    equity = np.asarray(equity, dtype=float)
+    opening = np.full(equity.shape[:-1] + (1,), starting_balance)
+    full = np.concatenate([opening, equity], axis=-1)
+
+    if (full[..., :-1] <= 0).any():
+        raise ComparisonError("Equity curve reached zero or below")
+
+    return np.diff(full, axis=-1) / full[..., :-1]
