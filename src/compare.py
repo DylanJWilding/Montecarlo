@@ -147,46 +147,6 @@ def prices_from_trades(trades):
     return combined["price"].to_numpy(dtype=float)
 
 
-def compare_to_benchmark(paths, benchmark_curve, starting_balance):
-    """
-    Compare every simulated path against the benchmark on both criteria.
-
-    Args:
-        paths: 2D array of simulated equity curves, one per row.
-        benchmark_curve: the buy and hold equity curve.
-        starting_balance: opening balance, shared by both.
-
-    Returns:
-        A dictionary containing, for the benchmark, its return, drawdown and
-        ratio; for the simulations, the same three as arrays; and two boolean
-        arrays recording whether each path beat the benchmark on return and
-        on return per unit of drawdown.
-    """
-    paths = np.asarray(paths, dtype=float)
-
-    if paths.ndim != 2:
-        raise ComparisonError("Simulated paths must be a 2D array")
-
-    benchmark_return = float(total_return(benchmark_curve, starting_balance))
-    benchmark_drawdown = float(max_drawdown(benchmark_curve, starting_balance))
-    benchmark_ratio = float(return_to_drawdown(benchmark_return, benchmark_drawdown))
-
-    path_returns = total_return(paths, starting_balance)
-    path_drawdowns = max_drawdown(paths, starting_balance)
-    path_ratios = return_to_drawdown(path_returns, path_drawdowns)
-
-    return {
-        "benchmark_return": benchmark_return,
-        "benchmark_drawdown": benchmark_drawdown,
-        "benchmark_ratio": benchmark_ratio,
-        "path_returns": path_returns,
-        "path_drawdowns": path_drawdowns,
-        "path_ratios": path_ratios,
-        "beats_on_return": path_returns > benchmark_return,
-        "beats_on_ratio": path_ratios > benchmark_ratio,
-    }
-
-
 # Approximate number of trading days in a year, used to annualise.
 TRADING_DAYS_PER_YEAR = 252
 
@@ -263,3 +223,66 @@ def returns_from_curve(equity, starting_balance):
         raise ComparisonError("Equity curve reached zero or below")
 
     return np.diff(full, axis=-1) / full[..., :-1]
+
+
+def compare_to_benchmark(paths, benchmark_curve, starting_balance,
+                         periods_per_year=None):
+    """
+    Compare every simulated path against the benchmark on both criteria.
+
+    Args:
+        paths: 2D array of simulated equity curves, one per row.
+        benchmark_curve: the buy and hold equity curve.
+        starting_balance: opening balance, shared by both.
+
+    Returns:
+        A dictionary containing, for the benchmark, its return, drawdown and
+        ratio; for the simulations, the same three as arrays; and two boolean
+        arrays recording whether each path beat the benchmark on return and
+        on return per unit of drawdown.
+    """
+    paths = np.asarray(paths, dtype=float)
+
+    if paths.ndim != 2:
+        raise ComparisonError("Simulated paths must be a 2D array")
+
+    benchmark_return = float(total_return(benchmark_curve, starting_balance))
+    benchmark_drawdown = float(max_drawdown(benchmark_curve, starting_balance))
+    benchmark_ratio = float(return_to_drawdown(benchmark_return, benchmark_drawdown))
+
+    path_returns = total_return(paths, starting_balance)
+    path_drawdowns = max_drawdown(paths, starting_balance)
+    path_ratios = return_to_drawdown(path_returns, path_drawdowns)
+
+    # The Sharpe ratio needs the per-step returns rather than the balances,
+    # so they are recovered from the curves here. The benchmark and the
+    # simulated paths may contain different numbers of steps, so each is
+    # annualised against its own frequency where annualisation is requested.
+    benchmark_returns = returns_from_curve(benchmark_curve, starting_balance)
+    path_step_returns = returns_from_curve(paths, starting_balance)
+
+    benchmark_periods = path_periods = None
+    if periods_per_year is not None:
+        path_periods = periods_per_year
+        # Scale the benchmark's frequency by its own number of observations,
+        # so both figures describe the same span of calendar time.
+        benchmark_periods = periods_per_year * (
+            len(benchmark_returns) / paths.shape[1]
+        )
+
+    benchmark_sharpe = float(sharpe_ratio(benchmark_returns, benchmark_periods))
+    path_sharpes = sharpe_ratio(path_step_returns, path_periods)
+
+    return {
+        "benchmark_sharpe": benchmark_sharpe,
+        "path_sharpes": path_sharpes,
+        "beats_on_sharpe": path_sharpes > benchmark_sharpe,
+        "benchmark_return": benchmark_return,
+        "benchmark_drawdown": benchmark_drawdown,
+        "benchmark_ratio": benchmark_ratio,
+        "path_returns": path_returns,
+        "path_drawdowns": path_drawdowns,
+        "path_ratios": path_ratios,
+        "beats_on_return": path_returns > benchmark_return,
+        "beats_on_ratio": path_ratios > benchmark_ratio,
+    }
