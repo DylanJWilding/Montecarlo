@@ -1,0 +1,2941 @@
+==============================================================================
+APPENDIX A: SOURCE CODE
+==============================================================================
+
+All code presented in this appendix was written by the author.
+No machine-generated or third-party code is included.
+
+
+==============================================================================
+CORE MODULES
+==============================================================================
+
+------------------------------------------------------------------------------
+  src/ingest.py   (167 lines)
+------------------------------------------------------------------------------
+
+"""
+ingest.py
+
+Loads and validates a StrategyQuant X / MetaTrader 5 trade list export and
+converts it into a clean internal format for the simulation engine.
+
+This module owns all knowledge of the export file format. Nothing downstream
+should need to know that the file is semicolon delimited or that dates use
+dots, because format quirks are isolated here (see FR1 to FR4).
+"""
+
+import pandas as pd
+
+
+# The exact datetime format SQX writes. Dots between date parts, not slashes
+# or dashes, so pandas cannot infer it reliably and we state it explicitly.
+SQX_DATETIME_FORMAT = "%Y.%m.%d %H:%M:%S"
+
+# Columns the rest of the pipeline depends on. The export contains more than
+# this, but these are the ones without which the simulation cannot run.
+REQUIRED_COLUMNS = [
+    "Open time",
+    "Close time",
+    "Type",
+    "Profit/Loss",
+    "Balance",
+    "Sample type",
+]
+
+# Columns kept after cleaning. Everything else in the export (MAE, MFE,
+# Comment, Time in trade and so on) is dropped because it is not used by the
+# simulation and carrying it adds no value.
+KEPT_COLUMNS = REQUIRED_COLUMNS
+
+
+class TradeDataError(ValueError):
+    """
+    Raised when a trade export cannot be loaded or fails validation.
+
+    A dedicated exception type means calling code (and the tests) can
+    distinguish a genuine data problem from an unrelated ValueError raised
+    somewhere inside pandas.
+    """
+
+
+def load_trades(filepath, starting_balance=None):
+    """
+    Load a trade export and return the cleaned trades plus the starting balance.
+
+    Args:
+        filepath: path to the CSV export.
+        starting_balance: optional override. If not supplied it is derived
+            from the file (see below).
+
+    Returns:
+        A tuple of (trades, starting_balance) where trades is a pandas
+        DataFrame sorted by close time.
+
+    Raises:
+        TradeDataError: if the file cannot be read, is missing required
+            columns, contains no trades, or has values of the wrong type.
+    """
+    trades = _read_file(filepath)
+    _validate_columns(trades)
+    trades = _parse_and_validate_types(trades)
+    trades = _sort_by_close_time(trades)
+
+    if starting_balance is None:
+        starting_balance = _derive_starting_balance(trades)
+
+    return trades[KEPT_COLUMNS].reset_index(drop=True), starting_balance
+
+
+def _read_file(filepath):
+    """
+    Read the raw CSV.
+
+    SQX writes semicolon separated values with every field wrapped in double
+    quotes, so the pandas defaults (comma separated) would put the entire row
+    into a single column.
+    """
+    try:
+        trades = pd.read_csv(filepath, sep=";", quotechar='"')
+    except FileNotFoundError:
+        raise TradeDataError(f"Trade file not found: {filepath}")
+    except pd.errors.EmptyDataError:
+        raise TradeDataError(f"Trade file is empty: {filepath}")
+    except Exception as error:
+        # Anything else pandas throws is re-raised in our own type so callers
+        # only ever have to handle TradeDataError.
+        raise TradeDataError(f"Could not read trade file {filepath}: {error}")
+
+    if trades.empty:
+        raise TradeDataError(f"Trade file contains no trades: {filepath}")
+
+    return trades
+
+
+def _validate_columns(trades):
+    """
+    Check every required column is present.
+
+    Reporting all missing columns at once, rather than failing on the first
+    one, means a user fixing a bad export sees the full problem immediately.
+    """
+    missing = [column for column in REQUIRED_COLUMNS if column not in trades.columns]
+
+    if missing:
+        raise TradeDataError(
+            f"Missing required columns: {missing}. "
+            f"Found columns: {list(trades.columns)}"
+        )
+
+
+def _parse_and_validate_types(trades):
+    """
+    Convert timestamps and numeric fields, failing clearly on bad values.
+
+    errors="coerce" turns anything unparseable into NaT/NaN rather than
+    throwing, which lets us count the bad rows and report how many there are
+    instead of surfacing a raw pandas error.
+    """
+    trades = trades.copy()
+
+    for column in ["Open time", "Close time"]:
+        trades[column] = pd.to_datetime(
+            trades[column], format=SQX_DATETIME_FORMAT, errors="coerce"
+        )
+        bad_rows = trades[column].isna().sum()
+        if bad_rows > 0:
+            raise TradeDataError(
+                f"Column '{column}' has {bad_rows} value(s) that do not match "
+                f"the expected format {SQX_DATETIME_FORMAT}"
+            )
+
+    for column in ["Profit/Loss", "Balance"]:
+        trades[column] = pd.to_numeric(trades[column], errors="coerce")
+        bad_rows = trades[column].isna().sum()
+        if bad_rows > 0:
+            raise TradeDataError(
+                f"Column '{column}' has {bad_rows} non-numeric value(s)"
+            )
+
+    return trades
+
+
+def _sort_by_close_time(trades):
+    """
+    Sort trades into the order they closed.
+
+    Order matters because an equity curve is a running total. The export is
+    usually already ordered, but relying on that would be an unstated
+    assumption, so we enforce it.
+    """
+    return trades.sort_values("Close time")
+
+
+def _derive_starting_balance(trades):
+    """
+    Work out the account balance before the first trade.
+
+    The export records the balance after each trade but never states the
+    opening balance, so it is recovered by subtracting the first trade's
+    profit or loss from the balance recorded against that trade.
+    """
+    first_trade = trades.iloc[0]
+    return float(first_trade["Balance"] - first_trade["Profit/Loss"])
+
+------------------------------------------------------------------------------
+  src/simulate.py   (203 lines)
+------------------------------------------------------------------------------
+
+"""
+simulate.py
+
+The Monte Carlo engine. Takes the profit and loss of each trade and produces
+a large set of alternative equity paths by resampling that sequence.
+
+The purpose is to separate a strategy's genuine edge from the luck of the
+particular order its trades happened to occur in. A single backtest is one
+realisation; this module generates many (see FR5 to FR8).
+"""
+
+import numpy as np
+
+
+# Resampling modes.
+#
+# WITH_REPLACEMENT draws trades at random from the original set, so a trade
+# can appear several times in one path or not at all. The total profit
+# therefore differs between paths, which produces a distribution of final
+# outcomes. This is the mode needed to ask whether the strategy is likely to
+# beat a benchmark, so it is the default.
+#
+# WITHOUT_REPLACEMENT reshuffles the original trades into a new order. Every
+# path contains exactly the same trades, so every path ends at exactly the
+# same balance. It answers a narrower question: given these trades, how much
+# did the order affect the drawdown along the way.
+WITH_REPLACEMENT = "with_replacement"
+WITHOUT_REPLACEMENT = "without_replacement"
+VALID_MODES = (WITH_REPLACEMENT, WITHOUT_REPLACEMENT)
+
+DEFAULT_SIMULATIONS = 10_000
+
+
+class SimulationError(ValueError):
+    """Raised when a simulation cannot be run with the given inputs."""
+
+
+def run_simulation(
+    profits,
+    starting_balance,
+    n_simulations=DEFAULT_SIMULATIONS,
+    mode=WITH_REPLACEMENT,
+    seed=None,
+    compound=False,
+):
+    """
+    Generate simulated equity paths by resampling the trade sequence.
+
+    Args:
+        profits: sequence of per-trade profit and loss values.
+        starting_balance: account balance before the first trade.
+        n_simulations: number of alternative paths to generate.
+        mode: WITH_REPLACEMENT or WITHOUT_REPLACEMENT.
+        seed: optional integer. Supplying one makes the run reproducible.
+        compound: whether the values supplied are fractional returns to be
+            compounded (True) or fixed monetary amounts to be added (False).
+            Use True whenever the strategy sizes its positions as a
+            percentage of the account, because in that case a trade's
+            monetary value depends on the balance at the time it was taken
+            and cannot meaningfully be transplanted to a different point in
+            a different sequence. See the note on _accumulate below.
+
+    Returns:
+        A 2D numpy array of shape (n_simulations, n_trades) where each row is
+        one simulated equity path and each column is the account balance
+        after that many trades.
+
+    Raises:
+        SimulationError: if the inputs are empty, non-numeric, or invalid.
+    """
+    profits = _validate_profits(profits)
+    _validate_simulation_count(n_simulations)
+    _validate_mode(mode)
+
+    # A seeded generator gives reproducible output, which the requirements
+    # need (FR7) and which also makes the results testable. Passing None
+    # produces a fresh random stream each run.
+    rng = np.random.default_rng(seed)
+
+    resampled = _resample(profits, n_simulations, mode, rng)
+
+    return _accumulate(resampled, starting_balance, compound)
+
+
+def _accumulate(resampled, starting_balance, compound):
+    """
+    Turn resampled trade outcomes into equity paths.
+
+    Two accumulation methods are needed because the two position sizing
+    regimes produce different kinds of number.
+
+    Under fixed monetary risk every trade stakes roughly the same amount
+    regardless of the balance, so a trade's result is a sum of money that
+    means the same thing anywhere in the sequence. Those are added.
+
+    Under percentage risk the amount staked scales with the account, so a
+    given trade's monetary result is only meaningful relative to the balance
+    at the time. Moving a large late-sequence loss to the start of a path
+    would apply a loss that could never have occurred at that balance. The
+    trade is therefore expressed as a fraction of the account and compounded,
+    which preserves its meaning wherever it lands.
+
+    Both are computed across the whole array at once rather than per
+    simulation, for the performance reasons noted above (NFR1).
+    """
+    if compound:
+        return starting_balance * np.cumprod(1.0 + resampled, axis=1)
+
+    return starting_balance + np.cumsum(resampled, axis=1)
+
+
+def to_returns(profits, balances):
+    """
+    Express each trade as a fraction of the account balance before it.
+
+    Needed to simulate a strategy that sizes positions as a percentage of
+    equity. The balance before a trade is recovered by subtracting that
+    trade's result from the balance recorded against it.
+    """
+    profits = np.asarray(profits, dtype=float)
+    balances = np.asarray(balances, dtype=float)
+
+    if profits.shape != balances.shape:
+        raise SimulationError("Profits and balances must be the same length")
+
+    equity_before = balances - profits
+
+    if (equity_before <= 0).any():
+        raise SimulationError("Account balance reached zero or below")
+
+    return profits / equity_before
+
+
+def equity_curve(profits, starting_balance, compound=False):
+    """
+    Build the actual historical equity curve, with no resampling.
+
+    This is the single path the strategy really produced. It is needed so the
+    real result can be positioned within the simulated distribution (FR14).
+    """
+    profits = _validate_profits(profits)
+
+    if compound:
+        return starting_balance * np.cumprod(1.0 + profits)
+
+    return starting_balance + np.cumsum(profits)
+
+
+def _resample(profits, n_simulations, mode, rng):
+    """
+    Produce the resampled trade sequences for every simulation.
+
+    Both branches build the entire (n_simulations, n_trades) array in one
+    operation rather than simulation by simulation.
+    """
+    n_trades = len(profits)
+
+    if mode == WITH_REPLACEMENT:
+        # Draw random positions into the original trade array. Because the
+        # same position can be drawn more than once, totals vary between
+        # paths.
+        indices = rng.integers(0, n_trades, size=(n_simulations, n_trades))
+    else:
+        # Generate a separate random permutation for each simulation.
+        # Sorting a row of random numbers yields the order that would sort
+        # them, which is a uniformly random permutation, and argsort applies
+        # this across every row at once.
+        indices = rng.random((n_simulations, n_trades)).argsort(axis=1)
+
+    return profits[indices]
+
+
+def _validate_profits(profits):
+    """Convert the trade profits to a numeric array and reject bad input."""
+    profits = np.asarray(profits, dtype=float)
+
+    if profits.ndim != 1:
+        raise SimulationError("Trade profits must be a one dimensional sequence")
+
+    if profits.size == 0:
+        raise SimulationError("Cannot simulate: no trades supplied")
+
+    if not np.isfinite(profits).all():
+        raise SimulationError("Trade profits contain missing or infinite values")
+
+    return profits
+
+
+def _validate_simulation_count(n_simulations):
+    if not isinstance(n_simulations, (int, np.integer)) or isinstance(n_simulations, bool):
+        raise SimulationError("Number of simulations must be an integer")
+
+    if n_simulations < 1:
+        raise SimulationError(
+            f"Number of simulations must be at least 1, got {n_simulations}"
+        )
+
+
+def _validate_mode(mode):
+    if mode not in VALID_MODES:
+        raise SimulationError(
+            f"Unknown resampling mode '{mode}'. Valid modes: {list(VALID_MODES)}"
+        )
+
+------------------------------------------------------------------------------
+  src/compare.py   (288 lines)
+------------------------------------------------------------------------------
+
+"""
+compare.py
+
+Builds the buy and hold benchmark and compares simulated strategy paths
+against it.
+
+Two questions are asked of every simulated path (FR9 to FR11):
+  1. Did it finish with a higher return than simply holding the market?
+  2. Did it achieve a better return per unit of drawdown?
+
+Both are reported because they can disagree. A strategy can beat the market
+on raw return while taking considerably more risk to get there, and reporting
+only the first would hide that.
+"""
+
+import numpy as np
+import pandas as pd
+
+
+class ComparisonError(ValueError):
+    """Raised when a benchmark or comparison cannot be computed."""
+
+
+def max_drawdown(equity, starting_balance):
+    """
+    Largest peak to trough decline, as a fraction of the running peak.
+
+    Drawdown is measured from the highest balance reached so far, not from
+    the opening balance, because that is the loss actually experienced by
+    someone holding the position: the distance fallen from the best point
+    they had already seen.
+
+    Works on a single equity curve or on a 2D array of many curves at once,
+    in which case one drawdown per row is returned.
+
+    Args:
+        equity: 1D curve or 2D array of curves (one per row).
+        starting_balance: balance before the first trade. Included as the
+            initial peak so that an immediate loss is counted properly.
+
+    Returns:
+        A float, or a 1D array of floats, in the range 0 to 1.
+    """
+    equity = np.asarray(equity, dtype=float)
+
+    if equity.size == 0:
+        raise ComparisonError("Cannot compute drawdown of an empty curve")
+
+    if starting_balance <= 0:
+        raise ComparisonError("Starting balance must be positive")
+
+    # Prepend the opening balance. Without it, a curve that only ever falls
+    # would report its first value as the peak and understate the loss.
+    opening = np.full(equity.shape[:-1] + (1,), starting_balance)
+    equity = np.concatenate([opening, equity], axis=-1)
+
+    running_peak = np.maximum.accumulate(equity, axis=-1)
+    drawdowns = (running_peak - equity) / running_peak
+
+    return drawdowns.max(axis=-1)
+
+
+def total_return(equity, starting_balance):
+    """
+    Overall return as a fraction of the opening balance.
+
+    Returns a float for a single curve, or one value per row for a 2D array.
+    """
+    equity = np.asarray(equity, dtype=float)
+    final_balance = equity[..., -1]
+    return (final_balance - starting_balance) / starting_balance
+
+
+def return_to_drawdown(total_return_value, max_drawdown_value):
+    """
+    Return earned per unit of drawdown suffered.
+
+    A strategy returning 50% with a 10% drawdown scores 5.0; the same return
+    with a 50% drawdown scores 1.0. This is what exposes a strategy that beats
+    the market only by taking far more risk.
+
+    A drawdown of zero would divide by zero. It is treated as infinite skill
+    only when the return is positive, and as zero otherwise, which avoids
+    rewarding a flat strategy that simply never lost anything.
+    """
+    total_return_value = np.asarray(total_return_value, dtype=float)
+    max_drawdown_value = np.asarray(max_drawdown_value, dtype=float)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(
+            max_drawdown_value > 0,
+            total_return_value / max_drawdown_value,
+            np.where(total_return_value > 0, np.inf, 0.0),
+        )
+
+    return ratio
+
+
+def buy_and_hold_curve(prices, starting_balance):
+    """
+    Equity curve for putting the whole opening balance into the market at the
+    start and holding to the end.
+
+    The position is unleveraged and never changes size, which is the point:
+    it is the simplest possible alternative to running a strategy at all.
+
+    Args:
+        prices: sequence of prices in chronological order.
+        starting_balance: amount invested at the first price.
+    """
+    prices = np.asarray(prices, dtype=float)
+
+    if prices.size < 2:
+        raise ComparisonError("Need at least two prices to build a benchmark")
+
+    if not np.isfinite(prices).all() or (prices <= 0).any():
+        raise ComparisonError("Prices must all be positive and finite")
+
+    # Scaling by the ratio to the first price converts the price series into
+    # the value of a fixed holding bought at the start.
+    return starting_balance * (prices / prices[0])
+
+
+def prices_from_trades(trades):
+    """
+    Recover an approximate price series from the trade log.
+
+    The log records the market price whenever a trade opened or closed, so
+    interleaving those in time order gives a sampled view of the market.
+
+    This is a fallback for when no proper price history is supplied. It is an
+    approximation, and specifically an optimistic one for the benchmark's
+    risk: because it only observes the market at trade times, any decline that
+    began and ended between two trades is invisible, so the benchmark's
+    drawdown will be understated. Where accuracy matters, supply a real price
+    series instead.
+    """
+    opens = trades[["Open time", "Open price"]].rename(
+        columns={"Open time": "time", "Open price": "price"}
+    )
+    closes = trades[["Close time", "Close price"]].rename(
+        columns={"Close time": "time", "Close price": "price"}
+    )
+
+    combined = pd.concat([opens, closes], ignore_index=True).sort_values("time")
+
+    return combined["price"].to_numpy(dtype=float)
+
+
+# Approximate number of trading days in a year, used to annualise.
+TRADING_DAYS_PER_YEAR = 252
+
+
+def sharpe_ratio(returns, periods_per_year=None, risk_free_rate=0.0):
+    """
+    Mean return divided by the standard deviation of returns.
+
+    Where the return-to-drawdown ratio penalises the single worst decline,
+    the Sharpe ratio penalises volatility throughout. The two can disagree: a
+    strategy with consistently choppy returns but no severe decline scores
+    poorly here and well there, so both are worth reporting.
+
+    Annualisation is applied by scaling with the square root of the number of
+    periods per year. Lo (2002) shows that this scaling is only valid when
+    returns are independent and identically distributed, an assumption that
+    real trade sequences frequently violate, so an annualised figure computed
+    this way should be read as an approximation rather than a precise
+    quantity. That caveat is the reason a distribution of outcomes is
+    reported alongside any single summary statistic.
+
+    Args:
+        returns: per-trade or per-period fractional returns. A 2D array is
+            treated as one series per row.
+        periods_per_year: supply to annualise; leave as None for the
+            per-period figure.
+        risk_free_rate: return available without taking risk, expressed per
+            period. Defaults to zero.
+
+    Returns:
+        A float, or one value per row for a 2D input.
+    """
+    returns = np.asarray(returns, dtype=float)
+
+    if returns.shape[-1] < 2:
+        raise ComparisonError("Need at least two returns to compute a Sharpe ratio")
+
+    excess = returns - risk_free_rate
+    mean = excess.mean(axis=-1)
+    # ddof=1 gives the sample standard deviation, appropriate because these
+    # returns are a sample of the strategy's behaviour rather than the whole
+    # population of trades it could ever produce.
+    deviation = excess.std(axis=-1, ddof=1)
+
+    # Zero volatility is handled the same way as zero drawdown above: a
+    # positive return earned with no variability at all is unbounded, while a
+    # flat or losing series earns nothing. Consistency between the two
+    # risk-adjusted measures matters here, since they are reported together.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(
+            deviation > 0,
+            mean / deviation,
+            np.where(mean > 0, np.inf, 0.0),
+        )
+
+    if periods_per_year is not None:
+        ratio = ratio * np.sqrt(periods_per_year)
+
+    return ratio
+
+
+def returns_from_curve(equity, starting_balance):
+    """
+    Recover the per-step fractional returns from an equity curve.
+
+    Lets the risk-adjusted measures be computed for simulated paths, which
+    are produced as balances rather than as returns.
+    """
+    equity = np.asarray(equity, dtype=float)
+    opening = np.full(equity.shape[:-1] + (1,), starting_balance)
+    full = np.concatenate([opening, equity], axis=-1)
+
+    if (full[..., :-1] <= 0).any():
+        raise ComparisonError("Equity curve reached zero or below")
+
+    return np.diff(full, axis=-1) / full[..., :-1]
+
+
+def compare_to_benchmark(paths, benchmark_curve, starting_balance,
+                         periods_per_year=None):
+    """
+    Compare every simulated path against the benchmark on both criteria.
+
+    Args:
+        paths: 2D array of simulated equity curves, one per row.
+        benchmark_curve: the buy and hold equity curve.
+        starting_balance: opening balance, shared by both.
+
+    Returns:
+        A dictionary containing, for the benchmark, its return, drawdown and
+        ratio; for the simulations, the same three as arrays; and two boolean
+        arrays recording whether each path beat the benchmark on return and
+        on return per unit of drawdown.
+    """
+    paths = np.asarray(paths, dtype=float)
+
+    if paths.ndim != 2:
+        raise ComparisonError("Simulated paths must be a 2D array")
+
+    benchmark_return = float(total_return(benchmark_curve, starting_balance))
+    benchmark_drawdown = float(max_drawdown(benchmark_curve, starting_balance))
+    benchmark_ratio = float(return_to_drawdown(benchmark_return, benchmark_drawdown))
+
+    path_returns = total_return(paths, starting_balance)
+    path_drawdowns = max_drawdown(paths, starting_balance)
+    path_ratios = return_to_drawdown(path_returns, path_drawdowns)
+
+    # The Sharpe ratio needs the per-step returns rather than the balances,
+    # so they are recovered from the curves here. The benchmark and the
+    # simulated paths may contain different numbers of steps, so each is
+    # annualised against its own frequency where annualisation is requested.
+    benchmark_returns = returns_from_curve(benchmark_curve, starting_balance)
+    path_step_returns = returns_from_curve(paths, starting_balance)
+
+    benchmark_periods = path_periods = None
+    if periods_per_year is not None:
+        path_periods = periods_per_year
+        # Scale the benchmark's frequency by its own number of observations,
+        # so both figures describe the same span of calendar time.
+        benchmark_periods = periods_per_year * (
+            len(benchmark_returns) / paths.shape[1]
+        )
+
+    benchmark_sharpe = float(sharpe_ratio(benchmark_returns, benchmark_periods))
+    path_sharpes = sharpe_ratio(path_step_returns, path_periods)
+
+    return {
+        "benchmark_sharpe": benchmark_sharpe,
+        "path_sharpes": path_sharpes,
+        "beats_on_sharpe": path_sharpes > benchmark_sharpe,
+        "benchmark_return": benchmark_return,
+        "benchmark_drawdown": benchmark_drawdown,
+        "benchmark_ratio": benchmark_ratio,
+        "path_returns": path_returns,
+        "path_drawdowns": path_drawdowns,
+        "path_ratios": path_ratios,
+        "beats_on_return": path_returns > benchmark_return,
+        "beats_on_ratio": path_ratios > benchmark_ratio,
+    }
+
+------------------------------------------------------------------------------
+  src/metrics.py   (249 lines)
+------------------------------------------------------------------------------
+
+"""
+metrics.py
+
+Turns the per-path comparison results into the figures actually reported to
+the user (FR12 to FR14).
+
+The comparison module answers "did this particular simulated path beat the
+benchmark?" once per path. This module answers "how often, and how confident
+can we be in that number?" across all of them, and locates the strategy's
+real historical result within the simulated distribution.
+"""
+
+import numpy as np
+
+from compare import (
+    max_drawdown,
+    total_return,
+    return_to_drawdown,
+    sharpe_ratio,
+    returns_from_curve,
+)
+
+
+class MetricsError(ValueError):
+    """Raised when summary figures cannot be computed."""
+
+
+# Percentiles reported for every distribution. The 5th and 95th bracket the
+# bulk of outcomes without being dominated by the extreme tails, and the
+# median is preferred to the mean because compounded return distributions are
+# skewed, which drags the mean away from the typical outcome.
+REPORTED_PERCENTILES = (5, 25, 50, 75, 95)
+
+
+def summarise_distribution(values, percentiles=REPORTED_PERCENTILES):
+    """
+    Describe a set of simulated outcomes.
+
+    Infinite values can arise legitimately from the risk-adjusted measures
+    when a path happened to suffer no drawdown at all, so they are excluded
+    from the summary and counted separately rather than being allowed to make
+    the mean meaningless.
+    """
+    values = np.asarray(values, dtype=float)
+
+    if values.size == 0:
+        raise MetricsError("Cannot summarise an empty set of results")
+
+    finite = values[np.isfinite(values)]
+
+    if finite.size == 0:
+        raise MetricsError("No finite values to summarise")
+
+    summary = {
+        "mean": float(finite.mean()),
+        "median": float(np.median(finite)),
+        "std": float(finite.std(ddof=1)) if finite.size > 1 else 0.0,
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "excluded_non_finite": int(values.size - finite.size),
+    }
+
+    for percentile in percentiles:
+        summary[f"p{percentile}"] = float(np.percentile(finite, percentile))
+
+    return summary
+
+
+def probability_with_interval(successes, confidence=0.95):
+    """
+    Proportion of simulations that met a condition, with a confidence interval.
+
+    The interval is the point that is easy to overlook. A reported probability
+    of 86 per cent is an estimate produced from a finite number of simulations,
+    not an exact quantity, and it would differ slightly if the simulation were
+    re-run with a different random seed. The interval states how much of that
+    wobble to expect, which is what makes the number honest.
+
+    A normal approximation to the binomial is used. It is reliable here
+    because the number of simulations is large, but it degrades when the
+    proportion sits very close to zero or one, so the interval is clipped to
+    remain within the valid range.
+
+    Args:
+        successes: boolean array, one entry per simulation.
+        confidence: confidence level, defaulting to 95 per cent.
+
+    Returns:
+        Dictionary with the probability, the interval bounds, the standard
+        error, and the number of simulations behind the estimate.
+    """
+    successes = np.asarray(successes, dtype=bool)
+
+    if successes.size == 0:
+        raise MetricsError("Cannot compute a probability from no simulations")
+
+    n = successes.size
+    probability = float(successes.mean())
+
+    # z score for the requested two-sided confidence level. Standard values
+    # are used rather than pulling in a statistics dependency for one number.
+    z_scores = {0.90: 1.645, 0.95: 1.960, 0.99: 2.576}
+    z = z_scores.get(round(confidence, 2))
+    if z is None:
+        raise MetricsError(
+            f"Unsupported confidence level {confidence}. "
+            f"Supported: {sorted(z_scores)}"
+        )
+
+    standard_error = np.sqrt(probability * (1 - probability) / n)
+    margin = z * standard_error
+
+    return {
+        "probability": probability,
+        "lower": float(max(0.0, probability - margin)),
+        "upper": float(min(1.0, probability + margin)),
+        "standard_error": float(standard_error),
+        "n_simulations": int(n),
+        "confidence": confidence,
+    }
+
+
+def percentile_of_actual(actual_value, simulated_values):
+    """
+    Where the real historical result sits within the simulated distribution.
+
+    This is the figure that directly addresses the project's central question.
+    A real backtest sitting at the 95th percentile of what the same trades
+    could have produced in a different order suggests the historical result
+    owed a good deal to a favourable sequence. One sitting near the middle
+    suggests it was typical of the strategy rather than lucky.
+    """
+    simulated_values = np.asarray(simulated_values, dtype=float)
+    finite = simulated_values[np.isfinite(simulated_values)]
+
+    if finite.size == 0:
+        raise MetricsError("No finite simulated values to compare against")
+
+    return float((finite < actual_value).mean() * 100)
+
+
+def build_report(
+    comparison,
+    actual_curve,
+    starting_balance,
+    periods_per_year=None,
+    confidence=0.95,
+):
+    """
+    Assemble the complete set of reported figures.
+
+    Args:
+        comparison: the dictionary returned by compare_to_benchmark.
+        actual_curve: the strategy's real historical equity curve.
+        starting_balance: opening balance.
+        periods_per_year: supply to annualise the Sharpe ratios.
+        confidence: confidence level for the probability intervals.
+
+    Returns:
+        A nested dictionary holding the benchmark figures, the strategy's real
+        figures, summaries of each simulated distribution, the probability of
+        beating the benchmark on each criterion, and the percentile position
+        of the real result within the simulations.
+    """
+    actual_curve = np.asarray(actual_curve, dtype=float)
+
+    actual_return = float(total_return(actual_curve, starting_balance))
+    actual_drawdown = float(max_drawdown(actual_curve, starting_balance))
+    actual_ratio = float(return_to_drawdown(actual_return, actual_drawdown))
+    actual_sharpe = float(
+        sharpe_ratio(
+            returns_from_curve(actual_curve, starting_balance), periods_per_year
+        )
+    )
+
+    path_sharpes = comparison.get("path_sharpes")
+
+    report = {
+        "benchmark": {
+            "return": comparison["benchmark_return"],
+            "max_drawdown": comparison["benchmark_drawdown"],
+            "return_to_drawdown": comparison["benchmark_ratio"],
+        },
+        "actual": {
+            "return": actual_return,
+            "max_drawdown": actual_drawdown,
+            "return_to_drawdown": actual_ratio,
+            "sharpe": actual_sharpe,
+        },
+        "simulated": {
+            "return": summarise_distribution(comparison["path_returns"]),
+            "max_drawdown": summarise_distribution(comparison["path_drawdowns"]),
+            "return_to_drawdown": summarise_distribution(comparison["path_ratios"]),
+        },
+        "probability_of_beating_benchmark": {
+            "on_return": probability_with_interval(
+                comparison["beats_on_return"], confidence
+            ),
+            "on_return_to_drawdown": probability_with_interval(
+                comparison["beats_on_ratio"], confidence
+            ),
+        },
+        "actual_result_percentile": {
+            "return": percentile_of_actual(
+                actual_return, comparison["path_returns"]
+            ),
+            "max_drawdown": percentile_of_actual(
+                actual_drawdown, comparison["path_drawdowns"]
+            ),
+        },
+    }
+
+    if path_sharpes is not None:
+        report["simulated"]["sharpe"] = summarise_distribution(path_sharpes)
+        report["actual_result_percentile"]["sharpe"] = percentile_of_actual(
+            actual_sharpe, path_sharpes
+        )
+        if "benchmark_sharpe" in comparison:
+            report["benchmark"]["sharpe"] = comparison["benchmark_sharpe"]
+            report["probability_of_beating_benchmark"]["on_sharpe"] = (
+                probability_with_interval(
+                    np.asarray(path_sharpes) > comparison["benchmark_sharpe"],
+                    confidence,
+                )
+            )
+
+    return report
+
+
+def report_to_rows(report):
+    """
+    Flatten the report into label and value pairs for display or export.
+
+    Keeping the flattening separate from the calculation means the same
+    figures can be shown on screen and written to a file without either
+    format dictating how they are computed.
+    """
+    rows = []
+    for section, contents in report.items():
+        if isinstance(contents, dict):
+            for key, value in contents.items():
+                if isinstance(value, dict):
+                    for inner_key, inner_value in value.items():
+                        rows.append((f"{section}.{key}.{inner_key}", inner_value))
+                else:
+                    rows.append((f"{section}.{key}", value))
+        else:
+            rows.append((section, contents))
+    return rows
+
+==============================================================================
+USER INTERFACE
+==============================================================================
+
+------------------------------------------------------------------------------
+  app.py   (378 lines)
+------------------------------------------------------------------------------
+
+"""
+app.py
+
+The user interface.
+
+Deliberately contains no analysis of its own: every figure shown here is
+produced by the core modules, which have no knowledge of this file. That
+separation is what allows the statistical work to be tested in isolation
+(NFR5), and it means the interface can be changed without any risk of
+altering a result.
+
+The presentation follows the decision recorded during design: the simulated
+equity paths are drawn overlaid on a single chart with the real backtest
+picked out among them. That form was chosen over percentile bands or
+histograms because it communicates the central idea without requiring the
+reader to know any statistics. They see many versions of the same strategy
+and can tell at once that the single curve they would normally be shown is
+only one of them.
+"""
+
+import io
+import json
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from ingest import load_trades, TradeDataError
+from simulate import (
+    run_simulation,
+    equity_curve,
+    to_returns,
+    WITH_REPLACEMENT,
+    WITHOUT_REPLACEMENT,
+    SimulationError,
+)
+from compare import (
+    buy_and_hold_curve,
+    prices_from_trades,
+    compare_to_benchmark,
+    ComparisonError,
+)
+from metrics import build_report, report_to_rows
+
+
+# Drawing every path would produce an unreadable block of colour and a very
+# large image, so a random subset is plotted. The statistics are always
+# computed on the full set; this limit affects only what is drawn.
+MAX_PATHS_DRAWN = 300
+
+st.set_page_config(page_title="Lucky or Good?", layout="wide")
+
+
+def main():
+    st.title("Lucky or Good?")
+    st.caption(
+        "Testing whether an algorithmic trading strategy really beats buy and hold, "
+        "or whether its backtest just got a favourable run of trades."
+    )
+
+    settings = sidebar_controls()
+
+    if settings["file"] is None:
+        show_introduction()
+        return
+
+    try:
+        analyse(settings)
+    except (TradeDataError, SimulationError, ComparisonError) as error:
+        st.error(str(error))
+
+
+def sidebar_controls():
+    """Collect the input file and simulation settings (FR16)."""
+    with st.sidebar:
+        st.header("Input")
+        uploaded = st.file_uploader("Strategy trade export (CSV)", type="csv")
+
+        st.header("Simulation")
+        n_simulations = st.select_slider(
+            "Number of simulations",
+            options=[1_000, 5_000, 10_000, 25_000, 50_000],
+            value=10_000,
+            help="More simulations give a steadier estimate but take longer.",
+        )
+        mode_label = st.radio(
+            "Resampling method",
+            ["Draw trades at random (with replacement)",
+             "Reshuffle the same trades (without replacement)"],
+            help=(
+                "Drawing at random varies the total profit, which is what "
+                "produces a range of possible outcomes to compare against the "
+                "market. Reshuffling keeps the same trades so every run ends "
+                "at the same balance, and only the path there changes."
+            ),
+        )
+        compound = st.checkbox(
+            "Strategy risks a percentage of the account",
+            value=True,
+            help=(
+                "Tick this if position sizes grow with the account. Trades are "
+                "then treated as percentage returns and compounded, because a "
+                "given trade's cash result only means something relative to "
+                "the balance it was taken on."
+            ),
+        )
+        seed = st.number_input(
+            "Random seed", min_value=0, max_value=999_999, value=42,
+            help="The same seed always produces the same result.",
+        )
+
+    return {
+        "file": uploaded,
+        "n_simulations": n_simulations,
+        "mode": WITH_REPLACEMENT if mode_label.startswith("Draw") else WITHOUT_REPLACEMENT,
+        "compound": compound,
+        "seed": int(seed),
+    }
+
+
+def show_introduction():
+    """Shown before a file is uploaded, explaining the idea from scratch."""
+    st.info("Upload a strategy's trade history in the sidebar to begin.")
+
+    st.subheader("What this does")
+    st.markdown(
+        """
+A **backtest** shows what a trading strategy would have made on past market
+data. It produces a single line, the **equity curve**, tracing the account
+balance over time. Traders routinely judge a strategy on that one line.
+
+The problem is that the line shows only one ordering of trades, and the order
+was largely luck. The same trades arriving in a different sequence would have
+produced a different-looking result, sometimes a much worse one.
+
+This tool takes the strategy's actual trades and rebuilds the account
+thousands of times, each with the trades drawn in a different order. That
+produces a range of results the strategy could plausibly have produced, rather
+than the single one it happened to.
+
+Each of those is then compared against **buy and hold**: simply purchasing the
+market at the start and holding to the end. If a strategy cannot beat that, its
+complexity has earned nothing.
+        """
+    )
+
+
+def analyse(settings):
+    """Run the full pipeline and display the results."""
+    raw = read_raw(settings["file"])
+    trades, starting_balance = load_trades(io.BytesIO(settings["file"].getvalue()))
+
+    profits = trades["Profit/Loss"].to_numpy()
+    balances = trades["Balance"].to_numpy()
+
+    # Under percentage sizing the simulation works in fractional returns; under
+    # fixed sizing it works in cash. See the note in simulate._accumulate.
+    values = to_returns(profits, balances) if settings["compound"] else profits
+
+    span_years = (
+        trades["Close time"].iloc[-1] - trades["Open time"].iloc[0]
+    ).days / 365.25
+    trades_per_year = len(trades) / span_years if span_years > 0 else None
+
+    with st.spinner(f"Running {settings['n_simulations']:,} simulations..."):
+        paths = run_simulation(
+            values,
+            starting_balance,
+            n_simulations=settings["n_simulations"],
+            mode=settings["mode"],
+            seed=settings["seed"],
+            compound=settings["compound"],
+        )
+        actual = equity_curve(values, starting_balance, compound=settings["compound"])
+        benchmark = buy_and_hold_curve(prices_from_trades(raw), starting_balance)
+        comparison = compare_to_benchmark(
+            paths, benchmark, starting_balance, periods_per_year=trades_per_year
+        )
+        report = build_report(
+            comparison, actual, starting_balance, periods_per_year=trades_per_year
+        )
+
+    show_headline(report)
+    show_chart(paths, actual, benchmark, starting_balance)
+    show_comparison_table(report)
+    show_where_the_real_result_sits(report)
+    show_export(report, settings)
+
+    st.caption(
+        "These figures are probabilities estimated from historical data. They "
+        "describe what the strategy might have done, not what it will do."
+    )
+
+
+def read_raw(uploaded_file):
+    """Read the upload again with the price columns needed for the benchmark."""
+    raw = pd.read_csv(io.BytesIO(uploaded_file.getvalue()), sep=";", quotechar='"')
+    for column in ("Open time", "Close time"):
+        raw[column] = pd.to_datetime(raw[column], format="%Y.%m.%d %H:%M:%S")
+    return raw
+
+
+def show_headline(report):
+    """The answer, stated in words before any chart or table (FR15)."""
+    st.subheader("Did it beat buy and hold?")
+
+    probabilities = report["probability_of_beating_benchmark"]
+    criteria = [
+        ("on_return", "On profit", "made more money"),
+        ("on_return_to_drawdown", "On profit per unit of loss", "earned more per unit of decline suffered"),
+        ("on_sharpe", "On steadiness of returns", "produced steadier returns"),
+    ]
+
+    columns = st.columns(len([c for c in criteria if c[0] in probabilities]))
+    for column, (key, label, phrase) in zip(columns, criteria):
+        if key not in probabilities:
+            continue
+        result = probabilities[key]
+        with column:
+            st.metric(label, f"{result['probability']:.1%}")
+            st.caption(
+                f"of simulations {phrase} than buy and hold "
+                f"(95% confidence: {result['lower']:.1%} to {result['upper']:.1%})"
+            )
+
+
+def show_chart(paths, actual, benchmark, starting_balance):
+    """The overlaid-paths chart, as decided during design."""
+    st.subheader("Every way this strategy could have gone")
+
+    figure, axes = plt.subplots(figsize=(11, 5.5))
+
+    drawn = paths[:MAX_PATHS_DRAWN]
+    trade_numbers = np.arange(1, paths.shape[1] + 1)
+
+    for path in drawn:
+        axes.plot(trade_numbers, path, color="#8fa8c8", alpha=0.06, linewidth=0.6)
+
+    axes.plot(trade_numbers, actual, color="#1f3d63", linewidth=2.0,
+              label="The backtest that actually happened")
+
+    # The benchmark is measured over price observations rather than trades, so
+    # it is stretched onto the same axis to make the comparison visible.
+    benchmark_x = np.linspace(1, paths.shape[1], len(benchmark))
+    axes.plot(benchmark_x, benchmark, color="#b3541e", linewidth=2.0,
+              linestyle="--", label="Buy and hold")
+
+    axes.axhline(starting_balance, color="#999999", linewidth=0.8, linestyle=":")
+    axes.set_xlabel("Number of trades")
+    axes.set_ylabel("Account balance")
+    axes.legend(loc="upper left", frameon=False)
+    axes.spines[["top", "right"]].set_visible(False)
+    axes.set_yscale("log")
+
+    st.pyplot(figure)
+    st.caption(
+        f"Each faint line is one simulated run of the same trades in a different "
+        f"order ({min(len(paths), MAX_PATHS_DRAWN)} of {len(paths):,} shown). "
+        f"A logarithmic scale is used so that proportional changes are "
+        f"comparable at every balance."
+    )
+
+
+def show_comparison_table(report):
+    st.subheader("The numbers")
+
+    rows = {
+        "Total return": ("return", "{:.1%}"),
+        "Worst decline from a peak": ("max_drawdown", "{:.1%}"),
+        "Return per unit of decline": ("return_to_drawdown", "{:.2f}"),
+        "Sharpe ratio (annualised)": ("sharpe", "{:.2f}"),
+    }
+
+    table = []
+    for label, (key, fmt) in rows.items():
+        if key not in report["actual"]:
+            continue
+        table.append({
+            "": label,
+            "The real backtest": fmt.format(report["actual"][key]),
+            "Buy and hold": (
+                fmt.format(report["benchmark"][key])
+                if key in report["benchmark"] else "n/a"
+            ),
+            "Simulated median": (
+                fmt.format(report["simulated"][key]["median"])
+                if key in report["simulated"] else "n/a"
+            ),
+            "Simulated range (5th to 95th)": (
+                f"{fmt.format(report['simulated'][key]['p5'])} to "
+                f"{fmt.format(report['simulated'][key]['p95'])}"
+                if key in report["simulated"] else "n/a"
+            ),
+        })
+
+    st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+
+
+def show_where_the_real_result_sits(report):
+    """
+    Locates the historical backtest within the simulated range, which is the
+    most direct answer to whether it was lucky.
+    """
+    st.subheader("Was the real backtest lucky?")
+
+    percentiles = report["actual_result_percentile"]
+    return_percentile = percentiles["return"]
+
+    if return_percentile >= 80:
+        verdict = (
+            f"The real backtest returned more than {return_percentile:.0f}% of the "
+            "simulated runs. It sits towards the fortunate end of what these trades "
+            "could have produced, so the historical figure likely flatters the strategy."
+        )
+    elif return_percentile <= 20:
+        verdict = (
+            f"The real backtest returned more than only {return_percentile:.0f}% of the "
+            "simulated runs. The historical result was on the unlucky side, and the "
+            "strategy may be better than its backtest suggests."
+        )
+    else:
+        verdict = (
+            f"The real backtest returned more than {return_percentile:.0f}% of the "
+            "simulated runs, placing it around the middle. The historical result looks "
+            "typical of these trades rather than notably lucky or unlucky."
+        )
+
+    st.write(verdict)
+    st.caption(
+        f"Its worst decline was deeper than {percentiles['max_drawdown']:.0f}% of "
+        "simulated runs."
+    )
+
+
+def show_export(report, settings):
+    """Export results with the settings needed to reproduce them (FR17)."""
+    st.subheader("Export")
+
+    payload = {
+        "settings": {
+            "n_simulations": settings["n_simulations"],
+            "mode": settings["mode"],
+            "compound": settings["compound"],
+            "seed": settings["seed"],
+        },
+        "results": report,
+    }
+
+    columns = st.columns(2)
+    with columns[0]:
+        st.download_button(
+            "Download results (JSON)",
+            data=json.dumps(payload, indent=2, default=float),
+            file_name="simulation_results.json",
+            mime="application/json",
+        )
+    with columns[1]:
+        frame = pd.DataFrame(report_to_rows(report), columns=["metric", "value"])
+        st.download_button(
+            "Download results (CSV)",
+            data=frame.to_csv(index=False),
+            file_name="simulation_results.csv",
+            mime="text/csv",
+        )
+
+    st.caption(
+        "Exports include the random seed and settings, so any result here can "
+        "be reproduced exactly."
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+TEST SUITE
+==============================================================================
+
+------------------------------------------------------------------------------
+  tests/test_ingest.py   (125 lines)
+------------------------------------------------------------------------------
+
+"""
+test_ingest.py
+
+Unit tests for the ingest module.
+
+The tests cover two things: that a valid export loads correctly, and that
+each kind of malformed input is rejected with a clear error rather than
+producing silently wrong data. The second group matters more, because a
+simulation built on quietly corrupted input would produce plausible looking
+results that are wrong.
+"""
+
+import os
+import sys
+
+import pandas as pd
+import pytest
+
+# Allow the tests to import from src/ when pytest is run from the project root.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from ingest import load_trades, TradeDataError, REQUIRED_COLUMNS
+
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+
+# Known facts about the real export, used as expected values below.
+EXPECTED_TRADE_COUNT = 736
+EXPECTED_STARTING_BALANCE = 100000.00
+
+
+def fixture(name):
+    """Build the path to a test fixture file."""
+    return os.path.join(FIXTURES, name)
+
+
+# ---------------------------------------------------------------------------
+# Loading a valid export
+# ---------------------------------------------------------------------------
+
+def test_loads_expected_number_of_trades():
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    assert len(trades) == EXPECTED_TRADE_COUNT
+
+
+def test_returns_only_the_required_columns():
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    assert list(trades.columns) == REQUIRED_COLUMNS
+
+
+def test_timestamps_are_parsed_as_datetimes():
+    """
+    If the dates were left as text, sorting would be alphabetical rather than
+    chronological, which would silently corrupt every equity curve.
+    """
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    assert pd.api.types.is_datetime64_any_dtype(trades["Open time"])
+    assert pd.api.types.is_datetime64_any_dtype(trades["Close time"])
+
+
+def test_profit_and_balance_are_numeric():
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    assert pd.api.types.is_numeric_dtype(trades["Profit/Loss"])
+    assert pd.api.types.is_numeric_dtype(trades["Balance"])
+
+
+def test_derives_starting_balance_from_first_trade():
+    _, starting_balance = load_trades(fixture("sample_trades.csv"))
+    assert starting_balance == pytest.approx(EXPECTED_STARTING_BALANCE)
+
+
+def test_explicit_starting_balance_overrides_derived_value():
+    _, starting_balance = load_trades(
+        fixture("sample_trades.csv"), starting_balance=50000
+    )
+    assert starting_balance == 50000
+
+
+def test_trades_are_sorted_by_close_time():
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    close_times = trades["Close time"]
+    assert close_times.is_monotonic_increasing
+
+
+def test_sample_type_column_is_retained():
+    """
+    The in-sample / out-of-sample labelling is needed later to compare
+    optimised periods against held-back ones, so it must survive ingest.
+    """
+    trades, _ = load_trades(fixture("sample_trades.csv"))
+    assert "Sample type" in trades.columns
+    assert trades["Sample type"].notna().all()
+
+
+# ---------------------------------------------------------------------------
+# Rejecting malformed input
+# ---------------------------------------------------------------------------
+
+def test_missing_column_raises_error():
+    with pytest.raises(TradeDataError) as error:
+        load_trades(fixture("missing_column.csv"))
+    assert "Profit/Loss" in str(error.value)
+
+
+def test_non_numeric_profit_raises_error():
+    with pytest.raises(TradeDataError) as error:
+        load_trades(fixture("bad_profit.csv"))
+    assert "Profit/Loss" in str(error.value)
+
+
+def test_bad_date_format_raises_error():
+    with pytest.raises(TradeDataError) as error:
+        load_trades(fixture("bad_date.csv"))
+    assert "Close time" in str(error.value)
+
+
+def test_file_with_no_trades_raises_error():
+    with pytest.raises(TradeDataError):
+        load_trades(fixture("empty.csv"))
+
+
+def test_missing_file_raises_error():
+    with pytest.raises(TradeDataError) as error:
+        load_trades(fixture("does_not_exist.csv"))
+    assert "not found" in str(error.value).lower()
+
+------------------------------------------------------------------------------
+  tests/test_simulate.py   (236 lines)
+------------------------------------------------------------------------------
+
+"""
+test_simulate.py
+
+Unit tests for the Monte Carlo engine.
+
+Testing a random process needs care: assertions have to hold for any valid
+random draw, not just the one that happened. The approach here is to test
+the properties that must always be true (output shape, reproducibility under
+a seed, and the mathematical invariants of each resampling mode) rather than
+comparing against specific random numbers.
+"""
+
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from simulate import (
+    run_simulation,
+    equity_curve,
+    SimulationError,
+    WITH_REPLACEMENT,
+    WITHOUT_REPLACEMENT,
+)
+
+
+# A small, hand checkable set of trades used throughout.
+PROFITS = np.array([100.0, -50.0, 200.0, -25.0, 75.0])
+STARTING_BALANCE = 1000.0
+
+
+# ---------------------------------------------------------------------------
+# Output shape and basic behaviour
+# ---------------------------------------------------------------------------
+
+def test_output_has_one_row_per_simulation_and_one_column_per_trade():
+    paths = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=50, seed=1)
+    assert paths.shape == (50, len(PROFITS))
+
+
+def test_first_column_is_starting_balance_plus_one_trade():
+    """
+    Every path begins with the opening balance adjusted by whichever trade was
+    drawn first, so the first column can only take one of the original trade
+    values as its offset.
+    """
+    paths = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=100, seed=1)
+    first_moves = paths[:, 0] - STARTING_BALANCE
+    assert np.isin(first_moves, PROFITS).all()
+
+
+def test_both_modes_run():
+    for mode in (WITH_REPLACEMENT, WITHOUT_REPLACEMENT):
+        paths = run_simulation(
+            PROFITS, STARTING_BALANCE, n_simulations=10, mode=mode, seed=1
+        )
+        assert paths.shape == (10, len(PROFITS))
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility (FR7)
+# ---------------------------------------------------------------------------
+
+def test_same_seed_produces_identical_results():
+    first = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=100, seed=42)
+    second = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=100, seed=42)
+    assert np.array_equal(first, second)
+
+
+def test_different_seeds_produce_different_results():
+    first = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=100, seed=1)
+    second = run_simulation(PROFITS, STARTING_BALANCE, n_simulations=100, seed=2)
+    assert not np.array_equal(first, second)
+
+
+# ---------------------------------------------------------------------------
+# Invariants of each resampling mode
+#
+# These are the tests that confirm the two modes are doing conceptually
+# different things, which is the reasoning behind offering both.
+# ---------------------------------------------------------------------------
+
+def test_without_replacement_always_ends_at_the_same_balance():
+    """
+    Reshuffling the same trades cannot change their total, so every path must
+    finish at the same final balance as the real strategy. Only the route
+    there differs.
+    """
+    paths = run_simulation(
+        PROFITS, STARTING_BALANCE, n_simulations=200,
+        mode=WITHOUT_REPLACEMENT, seed=1,
+    )
+    expected_final = STARTING_BALANCE + PROFITS.sum()
+    assert np.allclose(paths[:, -1], expected_final)
+
+
+def test_without_replacement_uses_each_trade_exactly_once():
+    paths = run_simulation(
+        PROFITS, STARTING_BALANCE, n_simulations=50,
+        mode=WITHOUT_REPLACEMENT, seed=1,
+    )
+    # Recover the individual trades from the running totals.
+    trades_per_path = np.diff(paths, prepend=STARTING_BALANCE, axis=1)
+    for path_trades in trades_per_path:
+        assert np.allclose(np.sort(path_trades), np.sort(PROFITS))
+
+
+def test_with_replacement_produces_varying_final_balances():
+    """
+    Drawing trades with replacement means totals differ between paths, which
+    is what creates the distribution of outcomes needed to compare against a
+    benchmark.
+    """
+    paths = run_simulation(
+        PROFITS, STARTING_BALANCE, n_simulations=500,
+        mode=WITH_REPLACEMENT, seed=1,
+    )
+    assert len(np.unique(paths[:, -1])) > 1
+
+
+def test_with_replacement_mean_final_balance_approaches_the_real_total():
+    """
+    Resampling with replacement is unbiased: over many simulations the average
+    final balance should converge on the strategy's actual final balance.
+    This is a correctness check against a value that can be derived rather
+    than observed (NFR4).
+    """
+    paths = run_simulation(
+        PROFITS, STARTING_BALANCE, n_simulations=20_000,
+        mode=WITH_REPLACEMENT, seed=7,
+    )
+    expected = STARTING_BALANCE + PROFITS.sum()
+    assert paths[:, -1].mean() == pytest.approx(expected, rel=0.05)
+
+
+# ---------------------------------------------------------------------------
+# The real (unresampled) equity curve
+# ---------------------------------------------------------------------------
+
+def test_equity_curve_matches_hand_calculation():
+    curve = equity_curve(PROFITS, STARTING_BALANCE)
+    expected = np.array([1100.0, 1050.0, 1250.0, 1225.0, 1300.0])
+    assert np.allclose(curve, expected)
+
+
+# ---------------------------------------------------------------------------
+# Invalid input
+# ---------------------------------------------------------------------------
+
+def test_empty_trade_list_raises_error():
+    with pytest.raises(SimulationError):
+        run_simulation([], STARTING_BALANCE)
+
+
+def test_zero_simulations_raises_error():
+    with pytest.raises(SimulationError):
+        run_simulation(PROFITS, STARTING_BALANCE, n_simulations=0)
+
+
+def test_unknown_mode_raises_error():
+    with pytest.raises(SimulationError) as error:
+        run_simulation(PROFITS, STARTING_BALANCE, mode="sideways")
+    assert "sideways" in str(error.value)
+
+
+def test_missing_values_raise_error():
+    with pytest.raises(SimulationError):
+        run_simulation([100.0, np.nan, 50.0], STARTING_BALANCE)
+
+
+# ---------------------------------------------------------------------------
+# Compounding mode
+#
+# Needed for strategies that size positions as a percentage of the account,
+# where a trade's monetary result depends on the balance at the time and so
+# cannot be transplanted to a different point in a different sequence.
+# ---------------------------------------------------------------------------
+
+from simulate import to_returns
+
+RETURNS = np.array([0.10, -0.05, 0.20, -0.025, 0.075])
+
+
+def test_compounding_multiplies_rather_than_adds():
+    curve = equity_curve(RETURNS, 1000.0, compound=True)
+    # 1000 * 1.10 * 0.95 * 1.20 * 0.975 * 1.075
+    assert curve[-1] == pytest.approx(1000 * 1.10 * 0.95 * 1.20 * 0.975 * 1.075)
+
+
+def test_compounded_simulation_has_expected_shape():
+    paths = run_simulation(RETURNS, 1000.0, n_simulations=50, seed=1, compound=True)
+    assert paths.shape == (50, len(RETURNS))
+
+
+def test_compounded_reshuffle_ends_at_same_balance():
+    """
+    Multiplication is commutative, so reordering compounded returns cannot
+    change the final balance, just as addition cannot for fixed amounts.
+    """
+    paths = run_simulation(
+        RETURNS, 1000.0, n_simulations=100,
+        mode=WITHOUT_REPLACEMENT, seed=1, compound=True,
+    )
+    expected = 1000.0 * np.prod(1 + RETURNS)
+    assert np.allclose(paths[:, -1], expected)
+
+
+def test_compounding_and_adding_give_different_results():
+    added = run_simulation(RETURNS, 1000.0, n_simulations=20, seed=3, compound=False)
+    compounded = run_simulation(RETURNS, 1000.0, n_simulations=20, seed=3, compound=True)
+    assert not np.allclose(added, compounded)
+
+
+def test_to_returns_recovers_the_fraction_risked():
+    profits = np.array([100.0, -55.0])
+    balances = np.array([1100.0, 1045.0])   # 1000 -> 1100 -> 1045
+    assert to_returns(profits, balances) == pytest.approx([0.10, -0.05])
+
+
+def test_to_returns_round_trips_through_compounding():
+    """
+    Converting a real balance history to returns and compounding them back
+    must reproduce the original final balance.
+    """
+    profits = np.array([100.0, -55.0, 209.0])
+    balances = np.array([1100.0, 1045.0, 1254.0])
+    returns = to_returns(profits, balances)
+    assert equity_curve(returns, 1000.0, compound=True)[-1] == pytest.approx(1254.0)
+
+
+def test_to_returns_rejects_mismatched_lengths():
+    with pytest.raises(SimulationError):
+        to_returns(np.array([100.0, 50.0]), np.array([1100.0]))
+
+------------------------------------------------------------------------------
+  tests/test_compare.py   (240 lines)
+------------------------------------------------------------------------------
+
+"""
+test_compare.py
+
+Unit tests for the benchmark and comparison logic.
+
+Drawdown is the easiest thing in this project to get subtly wrong, so most of
+these tests use small curves where the correct answer can be worked out by
+hand and checked against.
+"""
+
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from compare import (
+    max_drawdown,
+    total_return,
+    return_to_drawdown,
+    buy_and_hold_curve,
+    compare_to_benchmark,
+    ComparisonError,
+)
+
+
+START = 1000.0
+
+
+# ---------------------------------------------------------------------------
+# Drawdown
+# ---------------------------------------------------------------------------
+
+def test_rising_curve_has_no_drawdown():
+    curve = np.array([1100.0, 1200.0, 1300.0])
+    assert max_drawdown(curve, START) == pytest.approx(0.0)
+
+
+def test_drawdown_measured_from_running_peak_not_from_start():
+    """
+    Rises to 2000 then falls to 1500. Measured from the peak that is a 25%
+    drawdown. Measured from the 1000 opening balance it would look like a
+    gain, which is why the peak is the correct reference point.
+    """
+    curve = np.array([1500.0, 2000.0, 1500.0])
+    assert max_drawdown(curve, START) == pytest.approx(0.25)
+
+
+def test_immediate_loss_is_counted_against_starting_balance():
+    """
+    A curve that only ever falls has no peak of its own, so the opening
+    balance has to serve as the initial peak or the loss is missed entirely.
+    """
+    curve = np.array([900.0, 800.0, 700.0])
+    assert max_drawdown(curve, START) == pytest.approx(0.30)
+
+
+def test_largest_of_several_drawdowns_is_reported():
+    # Falls 1200 to 1080 (10%), recovers, then falls 2000 to 1400 (30%).
+    curve = np.array([1200.0, 1080.0, 2000.0, 1400.0])
+    assert max_drawdown(curve, START) == pytest.approx(0.30)
+
+
+def test_drawdown_computed_per_row_for_many_curves():
+    curves = np.array([
+        [1500.0, 2000.0, 1500.0],   # 25%
+        [1100.0, 1200.0, 1300.0],   # 0%
+        [900.0, 800.0, 700.0],      # 30%
+    ])
+    result = max_drawdown(curves, START)
+    assert result == pytest.approx([0.25, 0.0, 0.30])
+
+
+def test_empty_curve_raises_error():
+    with pytest.raises(ComparisonError):
+        max_drawdown(np.array([]), START)
+
+
+# ---------------------------------------------------------------------------
+# Return and ratio
+# ---------------------------------------------------------------------------
+
+def test_total_return_is_fraction_of_starting_balance():
+    assert total_return(np.array([1100.0, 1500.0]), START) == pytest.approx(0.5)
+
+
+def test_total_return_can_be_negative():
+    assert total_return(np.array([900.0, 700.0]), START) == pytest.approx(-0.3)
+
+
+def test_ratio_divides_return_by_drawdown():
+    assert return_to_drawdown(0.5, 0.1) == pytest.approx(5.0)
+
+
+def test_ratio_penalises_the_same_return_earned_with_more_drawdown():
+    """The property that makes this metric worth reporting alongside return."""
+    assert return_to_drawdown(0.5, 0.5) < return_to_drawdown(0.5, 0.1)
+
+
+def test_zero_drawdown_with_profit_is_infinite():
+    assert np.isinf(return_to_drawdown(0.5, 0.0))
+
+
+def test_zero_drawdown_without_profit_is_not_rewarded():
+    """A flat strategy that never lost anything has not demonstrated skill."""
+    assert return_to_drawdown(0.0, 0.0) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Buy and hold benchmark
+# ---------------------------------------------------------------------------
+
+def test_benchmark_tracks_the_price_series():
+    """Price doubling should double the account, since the holding is fixed."""
+    curve = buy_and_hold_curve([100.0, 150.0, 200.0], START)
+    assert curve == pytest.approx([1000.0, 1500.0, 2000.0])
+
+
+def test_benchmark_return_matches_price_change():
+    curve = buy_and_hold_curve([100.0, 120.0], START)
+    assert total_return(curve, START) == pytest.approx(0.2)
+
+
+def test_benchmark_rejects_negative_prices():
+    with pytest.raises(ComparisonError):
+        buy_and_hold_curve([100.0, -50.0], START)
+
+
+def test_benchmark_needs_at_least_two_prices():
+    with pytest.raises(ComparisonError):
+        buy_and_hold_curve([100.0], START)
+
+
+# ---------------------------------------------------------------------------
+# Comparing simulations against the benchmark
+# ---------------------------------------------------------------------------
+
+def test_comparison_flags_which_paths_beat_the_benchmark_on_return():
+    benchmark = buy_and_hold_curve([100.0, 110.0], START)   # +10%
+    paths = np.array([
+        [1000.0, 1200.0],   # +20%, beats it
+        [1000.0, 1050.0],   # +5%, does not
+    ])
+    result = compare_to_benchmark(paths, benchmark, START)
+    assert list(result["beats_on_return"]) == [True, False]
+
+
+def test_a_path_can_win_on_return_but_lose_on_ratio():
+    """
+    The case that justifies reporting both criteria: a path finishes ahead but
+    only by enduring a far deeper decline along the way.
+    """
+    benchmark = buy_and_hold_curve([100.0, 105.0, 110.0], START)  # +10%, no drawdown
+    paths = np.array([[1000.0, 500.0, 1200.0]])  # +20% but a 50% drawdown
+    result = compare_to_benchmark(paths, benchmark, START)
+    assert result["beats_on_return"][0]
+    assert not result["beats_on_ratio"][0]
+
+
+def test_comparison_returns_one_value_per_path():
+    benchmark = buy_and_hold_curve([100.0, 110.0], START)
+    paths = np.array([[1000.0, 1200.0], [1000.0, 900.0], [1000.0, 1100.0]])
+    result = compare_to_benchmark(paths, benchmark, START)
+    assert len(result["path_returns"]) == 3
+    assert len(result["path_drawdowns"]) == 3
+    assert len(result["path_ratios"]) == 3
+
+
+def test_comparison_rejects_one_dimensional_input():
+    benchmark = buy_and_hold_curve([100.0, 110.0], START)
+    with pytest.raises(ComparisonError):
+        compare_to_benchmark(np.array([1000.0, 1200.0]), benchmark, START)
+
+
+# ---------------------------------------------------------------------------
+# Risk adjusted measures
+# ---------------------------------------------------------------------------
+
+from compare import sharpe_ratio, returns_from_curve
+
+
+def test_sharpe_is_mean_over_standard_deviation():
+    returns = np.array([0.01, 0.02, 0.03, 0.04])
+    expected = returns.mean() / returns.std(ddof=1)
+    assert sharpe_ratio(returns) == pytest.approx(expected)
+
+
+def test_steadier_returns_score_higher_than_volatile_ones():
+    """
+    The property that makes the Sharpe ratio worth reporting next to the
+    drawdown ratio: both series average the same, but one is far choppier.
+    """
+    steady = np.array([0.018, 0.022, 0.019, 0.021])
+    volatile = np.array([-0.10, 0.14, -0.08, 0.12])
+    assert steady.mean() == pytest.approx(volatile.mean())
+    assert sharpe_ratio(steady) > sharpe_ratio(volatile)
+
+
+def test_constant_positive_returns_are_unbounded():
+    """
+    Matches the treatment of zero drawdown: profit with no variability at all
+    is unbounded rather than zero. The two risk-adjusted measures are
+    reported together so they must handle the degenerate case the same way.
+    """
+    assert np.isinf(sharpe_ratio(np.array([0.02, 0.02, 0.02])))
+
+
+def test_constant_zero_returns_score_nothing():
+    assert sharpe_ratio(np.array([0.0, 0.0, 0.0])) == pytest.approx(0.0)
+
+
+def test_annualising_scales_by_root_of_periods():
+    returns = np.array([0.01, -0.005, 0.02, 0.015])
+    assert sharpe_ratio(returns, periods_per_year=252) == pytest.approx(
+        sharpe_ratio(returns) * np.sqrt(252)
+    )
+
+
+def test_sharpe_computed_per_row_for_many_series():
+    series = np.array([[0.01, 0.02, 0.03], [-0.01, 0.05, -0.02]])
+    assert len(sharpe_ratio(series)) == 2
+
+
+def test_sharpe_needs_at_least_two_returns():
+    with pytest.raises(ComparisonError):
+        sharpe_ratio(np.array([0.01]))
+
+
+def test_returns_recovered_from_a_curve():
+    curve = np.array([1100.0, 1045.0])
+    assert returns_from_curve(curve, 1000.0) == pytest.approx([0.10, -0.05])
+
+
+def test_returns_recovered_per_row_for_many_curves():
+    curves = np.array([[1100.0, 1045.0], [900.0, 990.0]])
+    result = returns_from_curve(curves, 1000.0)
+    assert result.shape == (2, 2)
+    assert result[1] == pytest.approx([-0.10, 0.10])
+
+------------------------------------------------------------------------------
+  tests/test_metrics.py   (137 lines)
+------------------------------------------------------------------------------
+
+"""
+test_metrics.py
+
+Unit tests for the reporting and aggregation layer.
+
+The figures produced here are the ones the user actually reads, so the tests
+concentrate on the properties that would mislead someone if they were wrong:
+that probabilities match a hand count, that confidence intervals behave
+sensibly as the number of simulations changes, and that infinite values from
+the risk-adjusted measures do not corrupt a summary.
+"""
+
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from metrics import (
+    summarise_distribution,
+    probability_with_interval,
+    percentile_of_actual,
+    report_to_rows,
+    MetricsError,
+)
+
+
+# ---------------------------------------------------------------------------
+# Summarising a distribution
+# ---------------------------------------------------------------------------
+
+def test_summary_reports_median_and_percentiles():
+    values = np.arange(1, 101)          # 1 to 100
+    summary = summarise_distribution(values)
+    assert summary["median"] == pytest.approx(50.5)
+    assert summary["p5"] == pytest.approx(np.percentile(values, 5))
+    assert summary["p95"] == pytest.approx(np.percentile(values, 95))
+
+
+def test_summary_excludes_infinite_values_and_counts_them():
+    """
+    An infinite risk-adjusted score is legitimate: it means a path suffered no
+    drawdown at all. Including it would make the mean infinite and destroy the
+    summary, so such values are set aside and reported separately.
+    """
+    values = np.array([1.0, 2.0, 3.0, np.inf])
+    summary = summarise_distribution(values)
+    assert summary["mean"] == pytest.approx(2.0)
+    assert summary["excluded_non_finite"] == 1
+
+
+def test_summary_of_empty_input_raises_error():
+    with pytest.raises(MetricsError):
+        summarise_distribution(np.array([]))
+
+
+def test_summary_of_all_infinite_values_raises_error():
+    with pytest.raises(MetricsError):
+        summarise_distribution(np.array([np.inf, np.inf]))
+
+
+# ---------------------------------------------------------------------------
+# Probabilities and confidence intervals
+# ---------------------------------------------------------------------------
+
+def test_probability_matches_a_hand_count():
+    successes = np.array([True, True, True, False])
+    assert probability_with_interval(successes)["probability"] == pytest.approx(0.75)
+
+
+def test_interval_brackets_the_estimate():
+    result = probability_with_interval(np.random.default_rng(1).random(1000) < 0.6)
+    assert result["lower"] < result["probability"] < result["upper"]
+
+
+def test_more_simulations_narrow_the_interval():
+    """
+    The property that makes the interval worth reporting: it is a statement
+    about how much the estimate would move if the simulation were re-run, and
+    that uncertainty falls as the number of simulations rises.
+    """
+    rng = np.random.default_rng(1)
+    small = probability_with_interval(rng.random(100) < 0.5)
+    large = probability_with_interval(rng.random(10_000) < 0.5)
+    small_width = small["upper"] - small["lower"]
+    large_width = large["upper"] - large["lower"]
+    assert large_width < small_width
+
+
+def test_interval_stays_within_zero_and_one():
+    """
+    The normal approximation can produce bounds outside the valid range when
+    the proportion is extreme, so the result is clipped.
+    """
+    result = probability_with_interval(np.ones(50, dtype=bool))
+    assert result["lower"] >= 0.0
+    assert result["upper"] <= 1.0
+
+
+def test_unsupported_confidence_level_raises_error():
+    with pytest.raises(MetricsError):
+        probability_with_interval(np.array([True, False]), confidence=0.42)
+
+
+def test_probability_from_no_simulations_raises_error():
+    with pytest.raises(MetricsError):
+        probability_with_interval(np.array([], dtype=bool))
+
+
+# ---------------------------------------------------------------------------
+# Locating the real result within the simulated distribution
+# ---------------------------------------------------------------------------
+
+def test_actual_at_the_middle_of_the_distribution():
+    simulated = np.arange(0, 100)
+    assert percentile_of_actual(50, simulated) == pytest.approx(50.0)
+
+
+def test_actual_above_every_simulation_is_the_top_percentile():
+    assert percentile_of_actual(1000, np.arange(0, 100)) == pytest.approx(100.0)
+
+
+def test_actual_below_every_simulation_is_the_bottom_percentile():
+    assert percentile_of_actual(-1, np.arange(0, 100)) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Flattening for display and export
+# ---------------------------------------------------------------------------
+
+def test_nested_report_is_flattened_to_labelled_rows():
+    report = {"benchmark": {"return": 0.5}, "actual": {"return": 0.7}}
+    rows = dict(report_to_rows(report))
+    assert rows["benchmark.return"] == 0.5
+    assert rows["actual.return"] == 0.7
+
+==============================================================================
+EVALUATION SCRIPTS
+==============================================================================
+
+------------------------------------------------------------------------------
+  evaluation/convergence.py   (254 lines)
+------------------------------------------------------------------------------
+
+"""
+convergence.py
+
+Evaluation: how many simulations are enough?
+
+The tool reports probabilities estimated from a finite number of simulated
+paths. Too few and the figure moves noticeably between runs; too many and the
+tool stops feeling interactive. The default has to be chosen somewhere, and
+the point of this script is to choose it from evidence rather than by picking
+a round number.
+
+Method: run the same input at increasing simulation counts, repeating each
+count several times with different random seeds, and measure how much the
+reported probability varies across those repeats. The spread of results at a
+given count is a direct measure of how much the answer would wobble if the
+user re-ran the tool.
+
+Run from the project root:  python evaluation/convergence.py
+"""
+
+import sys
+import time
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from ingest import load_trades
+from simulate import run_simulation, equity_curve, to_returns
+from compare import buy_and_hold_curve, prices_from_trades, compare_to_benchmark
+
+
+DATA = ROOT / "tests" / "fixtures" / "sample_trades.csv"
+OUTPUT = ROOT / "evaluation" / "results"
+
+SIMULATION_COUNTS = [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000]
+REPEATS = 12          # independent seeds per count
+CONFIDENCE_TARGET = 0.005   # half a percentage point of spread
+
+
+def load_inputs():
+    """Load the trade data and build everything the simulation needs."""
+    trades, starting_balance = load_trades(DATA)
+
+    raw = pd.read_csv(DATA, sep=";", quotechar='"')
+    for column in ("Open time", "Close time"):
+        raw[column] = pd.to_datetime(raw[column], format="%Y.%m.%d %H:%M:%S")
+
+    returns = to_returns(
+        trades["Profit/Loss"].to_numpy(), trades["Balance"].to_numpy()
+    )
+    benchmark = buy_and_hold_curve(prices_from_trades(raw), starting_balance)
+
+    span_years = (
+        trades["Close time"].iloc[-1] - trades["Open time"].iloc[0]
+    ).days / 365.25
+
+    return {
+        "returns": returns,
+        "starting_balance": starting_balance,
+        "benchmark": benchmark,
+        "periods_per_year": len(trades) / span_years,
+    }
+
+
+def measure_convergence(inputs):
+    """
+    Record the reported probabilities at each simulation count, across
+    several seeds, so the variation between repeats can be measured.
+    """
+    records = []
+
+    for count in SIMULATION_COUNTS:
+        for repeat in range(REPEATS):
+            started = time.perf_counter()
+
+            paths = run_simulation(
+                inputs["returns"],
+                inputs["starting_balance"],
+                n_simulations=count,
+                seed=1000 + repeat,
+                compound=True,
+            )
+            comparison = compare_to_benchmark(
+                paths,
+                inputs["benchmark"],
+                inputs["starting_balance"],
+                periods_per_year=inputs["periods_per_year"],
+            )
+
+            records.append({
+                "n_simulations": count,
+                "seed": 1000 + repeat,
+                "p_return": comparison["beats_on_return"].mean(),
+                "p_ratio": comparison["beats_on_ratio"].mean(),
+                "p_sharpe": comparison["beats_on_sharpe"].mean(),
+                "seconds": time.perf_counter() - started,
+            })
+
+        print(f"  completed {count:,} simulations x {REPEATS} seeds")
+
+    return pd.DataFrame(records)
+
+
+def summarise(results):
+    """
+    For each simulation count, how much did the answer vary between seeds?
+
+    The range (highest minus lowest across repeats) is reported alongside the
+    standard deviation because it is the figure a user would actually notice:
+    it is the worst disagreement they could see between two runs.
+    """
+    summary = results.groupby("n_simulations").agg(
+        p_return_mean=("p_return", "mean"),
+        p_return_std=("p_return", "std"),
+        p_return_range=("p_return", lambda values: values.max() - values.min()),
+        p_ratio_mean=("p_ratio", "mean"),
+        p_ratio_std=("p_ratio", "std"),
+        p_ratio_range=("p_ratio", lambda values: values.max() - values.min()),
+        p_sharpe_mean=("p_sharpe", "mean"),
+        p_sharpe_std=("p_sharpe", "std"),
+        p_sharpe_range=("p_sharpe", lambda values: values.max() - values.min()),
+        mean_seconds=("seconds", "mean"),
+    ).reset_index()
+
+    return summary
+
+
+def recommend(summary):
+    """
+    Smallest count at which every reported probability is stable to within
+    the target spread. Stated as a rule applied to the data rather than a
+    judgement, so the recommendation can be reproduced.
+    """
+    stable = summary[
+        (summary["p_return_range"] <= CONFIDENCE_TARGET)
+        & (summary["p_ratio_range"] <= CONFIDENCE_TARGET)
+        & (summary["p_sharpe_range"] <= CONFIDENCE_TARGET)
+    ]
+
+    if stable.empty:
+        return None
+
+    return int(stable["n_simulations"].iloc[0])
+
+
+def plot_convergence(results, summary, recommended):
+    """Two panels: the spread of estimates, and how fast that spread falls."""
+    figure, (top, bottom) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
+
+    # Panel 1: every individual run, showing the scatter narrowing.
+    for label, column, colour in (
+        ("Beats on return", "p_return", "#b3541e"),
+        ("Beats on return/drawdown", "p_ratio", "#1f3d63"),
+        ("Beats on Sharpe", "p_sharpe", "#2e7d5b"),
+    ):
+        top.scatter(
+            results["n_simulations"], results[column],
+            alpha=0.35, s=18, color=colour, label=label,
+        )
+        means = summary.set_index("n_simulations")[f"{column}_mean"]
+        top.plot(means.index, means.values, color=colour, linewidth=1.2)
+
+    top.set_xscale("log")
+    top.set_ylabel("Reported probability")
+    top.set_title("Estimates from repeated runs at each simulation count")
+    top.legend(frameon=False, fontsize=9)
+    top.spines[["top", "right"]].set_visible(False)
+
+    # Panel 2: the spread itself, which is what the decision rests on.
+    for label, column, colour in (
+        ("Beats on return", "p_return_range", "#b3541e"),
+        ("Beats on return/drawdown", "p_ratio_range", "#1f3d63"),
+        ("Beats on Sharpe", "p_sharpe_range", "#2e7d5b"),
+    ):
+        bottom.plot(
+            summary["n_simulations"], summary[column],
+            marker="o", markersize=4, color=colour, label=label,
+        )
+
+    bottom.axhline(
+        CONFIDENCE_TARGET, color="#999999", linestyle="--", linewidth=1,
+        label=f"Target spread ({CONFIDENCE_TARGET:.1%})",
+    )
+    if recommended is not None:
+        bottom.axvline(
+            recommended, color="#333333", linestyle=":", linewidth=1.2,
+            label=f"Chosen default ({recommended:,})",
+        )
+
+    bottom.set_xscale("log")
+    bottom.set_yscale("log")
+    bottom.set_xlabel("Number of simulations")
+    bottom.set_ylabel("Spread across repeats")
+    bottom.set_title("How much the answer moves between runs")
+    bottom.legend(frameon=False, fontsize=9)
+    bottom.spines[["top", "right"]].set_visible(False)
+
+    figure.tight_layout()
+    figure.savefig(OUTPUT / "convergence.png", dpi=150)
+    print(f"  chart written to {OUTPUT / 'convergence.png'}")
+
+
+def main():
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+
+    print("Convergence analysis")
+    print(f"  {len(SIMULATION_COUNTS)} counts x {REPEATS} seeds")
+
+    inputs = load_inputs()
+    results = measure_convergence(inputs)
+    summary = summarise(results)
+    recommended = recommend(summary)
+
+    results.to_csv(OUTPUT / "convergence_raw.csv", index=False)
+    summary.to_csv(OUTPUT / "convergence_summary.csv", index=False)
+    plot_convergence(results, summary, recommended)
+
+    print("\n  n_sims   spread(return)  spread(ret/DD)  spread(Sharpe)   time")
+    for _, row in summary.iterrows():
+        print(
+            f"  {int(row['n_simulations']):>7,}  "
+            f"{row['p_return_range']:>13.2%}  "
+            f"{row['p_ratio_range']:>13.2%}  "
+            f"{row['p_sharpe_range']:>13.2%}  "
+            f"{row['mean_seconds']:>6.2f}s"
+        )
+
+    if recommended is None:
+        print(
+            f"\n  No tested count held every estimate within "
+            f"{CONFIDENCE_TARGET:.1%}. Report the trend and choose on the "
+            f"time/stability trade-off."
+        )
+    else:
+        seconds = float(
+            summary.loc[
+                summary["n_simulations"] == recommended, "mean_seconds"
+            ].iloc[0]
+        )
+        print(
+            f"\n  Recommended default: {recommended:,} simulations "
+            f"({seconds:.2f}s per run)"
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+------------------------------------------------------------------------------
+  evaluation/performance.py   (317 lines)
+------------------------------------------------------------------------------
+
+"""
+performance.py
+
+Evaluation: how does the tool scale, and where does it stop being practical?
+
+The requirements set an interactive response target (NFR1). This script
+measures execution time and peak memory against the number of simulations and
+against the length of the trade history, so the target can be shown to be met
+and the point at which it fails can be stated honestly rather than left
+undiscovered.
+
+It also compares the vectorised implementation against a straightforward loop,
+which turns a design decision made during the build into a measured result.
+
+Run from the project root:  python evaluation/performance.py
+"""
+
+import sys
+import time
+import tracemalloc
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from ingest import load_trades
+from simulate import run_simulation, to_returns
+from compare import buy_and_hold_curve, prices_from_trades, compare_to_benchmark
+
+
+DATA = ROOT / "tests" / "fixtures" / "sample_trades.csv"
+OUTPUT = ROOT / "evaluation" / "results"
+
+SIMULATION_COUNTS = [1_000, 5_000, 10_000, 25_000, 50_000, 100_000]
+TRADE_COUNTS = [100, 250, 500, 736, 1_500, 3_000]
+INTERACTIVE_TARGET_SECONDS = 10.0
+REPEATS = 3
+
+
+def load_returns():
+    trades, starting_balance = load_trades(DATA)
+    returns = to_returns(
+        trades["Profit/Loss"].to_numpy(), trades["Balance"].to_numpy()
+    )
+    return returns, starting_balance
+
+
+def time_run(function, repeats=REPEATS):
+    """
+    Best of several repeats, with peak memory.
+
+    The minimum is used rather than the mean because a slow repeat reflects
+    interference from other work on the machine, not the cost of the
+    computation itself. Peak memory is captured on a single run since it does
+    not vary between repeats.
+    """
+    tracemalloc.start()
+    function()
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    timings = []
+    for _ in range(repeats):
+        started = time.perf_counter()
+        function()
+        timings.append(time.perf_counter() - started)
+
+    return min(timings), peak_bytes / 1e6
+
+
+def scaling_with_simulations(returns, starting_balance):
+    """Time and memory as the number of simulated paths grows."""
+    records = []
+
+    for count in SIMULATION_COUNTS:
+        seconds, megabytes = time_run(
+            lambda c=count: run_simulation(
+                returns, starting_balance, n_simulations=c, seed=1, compound=True
+            )
+        )
+        records.append({
+            "n_simulations": count,
+            "seconds": seconds,
+            "peak_mb": megabytes,
+            "within_target": seconds <= INTERACTIVE_TARGET_SECONDS,
+        })
+        print(f"  {count:>7,} simulations: {seconds:>6.2f}s, {megabytes:>7.0f} MB")
+
+    return pd.DataFrame(records)
+
+
+def scaling_with_trade_count(returns, starting_balance):
+    """
+    Time as the trade history lengthens, at a fixed number of simulations.
+
+    Longer histories are produced by resampling the real returns, so the
+    statistical character of the input is preserved while its length changes.
+    """
+    records = []
+    rng = np.random.default_rng(0)
+
+    for count in TRADE_COUNTS:
+        if count <= len(returns):
+            subset = returns[:count]
+        else:
+            subset = rng.choice(returns, size=count, replace=True)
+
+        seconds, megabytes = time_run(
+            lambda s=subset: run_simulation(
+                s, starting_balance, n_simulations=10_000, seed=1, compound=True
+            )
+        )
+        records.append({
+            "n_trades": count,
+            "seconds": seconds,
+            "peak_mb": megabytes,
+        })
+        print(f"  {count:>7,} trades:      {seconds:>6.2f}s, {megabytes:>7.0f} MB")
+
+    return pd.DataFrame(records)
+
+
+def simulate_with_loop(returns, starting_balance, n_simulations, seed):
+    """
+    The obvious implementation: build each simulated path one at a time.
+
+    Kept only as a baseline for the comparison below. It produces the same
+    result as the vectorised version but constructs it simulation by
+    simulation in Python rather than as a single array operation.
+    """
+    rng = np.random.default_rng(seed)
+    n_trades = len(returns)
+    paths = np.empty((n_simulations, n_trades))
+
+    for row in range(n_simulations):
+        drawn = returns[rng.integers(0, n_trades, size=n_trades)]
+        paths[row] = starting_balance * np.cumprod(1.0 + drawn)
+
+    return paths
+
+
+def vectorised_versus_loop(returns, starting_balance):
+    """
+    Quantify the design decision to vectorise.
+
+    Only the smaller counts are run through the loop, because at larger ones
+    it takes long enough to make the point without needing to be measured.
+    """
+    records = []
+
+    for count in [1_000, 5_000, 10_000, 25_000]:
+        vector_seconds, _ = time_run(
+            lambda c=count: run_simulation(
+                returns, starting_balance, n_simulations=c, seed=1, compound=True
+            )
+        )
+        loop_seconds, _ = time_run(
+            lambda c=count: simulate_with_loop(returns, starting_balance, c, 1),
+            repeats=1,
+        )
+
+        records.append({
+            "n_simulations": count,
+            "vectorised_seconds": vector_seconds,
+            "loop_seconds": loop_seconds,
+            "speedup": loop_seconds / vector_seconds,
+        })
+        print(
+            f"  {count:>7,}: vectorised {vector_seconds:>6.2f}s, "
+            f"loop {loop_seconds:>6.2f}s, {loop_seconds / vector_seconds:>5.1f}x faster"
+        )
+
+    return pd.DataFrame(records)
+
+
+def full_pipeline_timing(returns, starting_balance):
+    """
+    Time the complete analysis, not just the simulation.
+
+    The interactive target applies to what the user waits for, which includes
+    building the benchmark and computing every comparison, so timing the
+    simulation alone would understate it.
+    """
+    trades, _ = load_trades(DATA)
+    raw = pd.read_csv(DATA, sep=";", quotechar='"')
+    for column in ("Open time", "Close time"):
+        raw[column] = pd.to_datetime(raw[column], format="%Y.%m.%d %H:%M:%S")
+    benchmark = buy_and_hold_curve(prices_from_trades(raw), starting_balance)
+
+    span_years = (
+        trades["Close time"].iloc[-1] - trades["Open time"].iloc[0]
+    ).days / 365.25
+    periods = len(trades) / span_years
+
+    records = []
+    for count in [10_000, 25_000, 50_000]:
+        def whole_analysis(c=count):
+            paths = run_simulation(
+                returns, starting_balance, n_simulations=c, seed=1, compound=True
+            )
+            return compare_to_benchmark(
+                paths, benchmark, starting_balance, periods_per_year=periods
+            )
+
+        seconds, megabytes = time_run(whole_analysis, repeats=2)
+        records.append({
+            "n_simulations": count,
+            "seconds": seconds,
+            "peak_mb": megabytes,
+            "within_target": seconds <= INTERACTIVE_TARGET_SECONDS,
+        })
+        print(f"  {count:>7,} simulations: {seconds:>6.2f}s, {megabytes:>7.0f} MB")
+
+    return pd.DataFrame(records)
+
+
+def plot_performance(by_simulations, by_trades, comparison, pipeline):
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
+
+    # Time and memory against simulation count.
+    left = axes[0][0]
+    left.plot(by_simulations["n_simulations"], by_simulations["seconds"],
+              marker="o", color="#1f3d63", label="Simulation only")
+    left.plot(pipeline["n_simulations"], pipeline["seconds"],
+              marker="s", color="#b3541e", label="Full analysis")
+    left.axhline(INTERACTIVE_TARGET_SECONDS, color="#999999", linestyle="--",
+                 linewidth=1, label=f"Target ({INTERACTIVE_TARGET_SECONDS:.0f}s)")
+    left.set_xscale("log")
+    left.set_xlabel("Number of simulations")
+    left.set_ylabel("Seconds")
+    left.set_title("Execution time")
+    left.legend(frameon=False, fontsize=8)
+    left.spines[["top", "right"]].set_visible(False)
+
+    right = axes[0][1]
+    right.plot(by_simulations["n_simulations"], by_simulations["peak_mb"],
+               marker="o", color="#2e7d5b")
+    right.set_xscale("log")
+    right.set_xlabel("Number of simulations")
+    right.set_ylabel("Peak memory (MB)")
+    right.set_title("Memory use")
+    right.spines[["top", "right"]].set_visible(False)
+
+    lower_left = axes[1][0]
+    lower_left.plot(by_trades["n_trades"], by_trades["seconds"],
+                    marker="o", color="#1f3d63")
+    lower_left.set_xlabel("Number of trades in history")
+    lower_left.set_ylabel("Seconds")
+    lower_left.set_title("Scaling with history length (10,000 simulations)")
+    lower_left.spines[["top", "right"]].set_visible(False)
+
+    lower_right = axes[1][1]
+    width = 0.35
+    positions = np.arange(len(comparison))
+    lower_right.bar(positions - width / 2, comparison["vectorised_seconds"],
+                    width, label="Vectorised", color="#1f3d63")
+    lower_right.bar(positions + width / 2, comparison["loop_seconds"],
+                    width, label="Loop", color="#c8b8a0")
+    lower_right.set_xticks(positions)
+    lower_right.set_xticklabels(
+        [f"{int(n / 1000)}k" for n in comparison["n_simulations"]]
+    )
+    lower_right.set_xlabel("Number of simulations")
+    lower_right.set_ylabel("Seconds")
+    lower_right.set_title("Effect of vectorising")
+    lower_right.legend(frameon=False, fontsize=8)
+    lower_right.spines[["top", "right"]].set_visible(False)
+
+    figure.tight_layout()
+    figure.savefig(OUTPUT / "performance.png", dpi=150)
+    print(f"\n  chart written to {OUTPUT / 'performance.png'}")
+
+
+def main():
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    returns, starting_balance = load_returns()
+
+    print("Performance: scaling with simulation count")
+    by_simulations = scaling_with_simulations(returns, starting_balance)
+
+    print("\nPerformance: scaling with trade history length")
+    by_trades = scaling_with_trade_count(returns, starting_balance)
+
+    print("\nPerformance: vectorised against a loop")
+    comparison = vectorised_versus_loop(returns, starting_balance)
+
+    print("\nPerformance: complete analysis")
+    pipeline = full_pipeline_timing(returns, starting_balance)
+
+    by_simulations.to_csv(OUTPUT / "performance_simulations.csv", index=False)
+    by_trades.to_csv(OUTPUT / "performance_trades.csv", index=False)
+    comparison.to_csv(OUTPUT / "performance_vectorisation.csv", index=False)
+    pipeline.to_csv(OUTPUT / "performance_pipeline.csv", index=False)
+    plot_performance(by_simulations, by_trades, comparison, pipeline)
+
+    breached = pipeline[~pipeline["within_target"]]
+    if breached.empty:
+        print(
+            f"\n  Every configuration tested completed within the "
+            f"{INTERACTIVE_TARGET_SECONDS:.0f}s interactive target."
+        )
+    else:
+        first = int(breached["n_simulations"].iloc[0])
+        print(f"\n  Interactive target first breached at {first:,} simulations.")
+
+    peak = by_simulations["peak_mb"].max()
+    print(f"  Peak memory across all configurations: {peak:,.0f} MB")
+
+
+if __name__ == "__main__":
+    main()
+
+------------------------------------------------------------------------------
+  evaluation/sensitivity.py   (260 lines)
+------------------------------------------------------------------------------
+
+"""
+sensitivity.py
+
+Evaluation: how much does the answer depend on position sizing?
+
+The strategy under test risks a fixed percentage of the account on each trade.
+That percentage is chosen by whoever trades the strategy, not by the strategy
+itself, and it is not obvious in advance how much the choice matters.
+
+This script re-runs the whole comparison across a range of sizing regimes. It
+was written after noticing during development that the conclusion appeared to
+change with sizing, and its purpose is to establish whether that impression
+holds and how large the effect is.
+
+The method rescales each trade into a multiple of the amount risked and
+compounds it at the chosen percentage. That assumes a trade's outcome relative
+to its risk is unchanged at a different position size, which holds reasonably
+for a strategy using fixed stop distances but ignores slippage and available
+liquidity at larger sizes. The assumption is stated because the results depend
+on it.
+
+Run from the project root:  python evaluation/sensitivity.py
+"""
+
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from ingest import load_trades
+from simulate import run_simulation, equity_curve, to_returns
+from compare import (
+    buy_and_hold_curve,
+    prices_from_trades,
+    compare_to_benchmark,
+    max_drawdown,
+    total_return,
+    return_to_drawdown,
+)
+
+
+DATA = ROOT / "tests" / "fixtures" / "sample_trades.csv"
+OUTPUT = ROOT / "evaluation" / "results"
+
+RISK_LEVELS = [0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
+BASELINE_RISK = 0.01          # the level used for the primary results
+N_SIMULATIONS = 25_000
+SEED = 42
+
+
+def load_inputs():
+    trades, starting_balance = load_trades(DATA)
+
+    raw = pd.read_csv(DATA, sep=";", quotechar='"')
+    for column in ("Open time", "Close time"):
+        raw[column] = pd.to_datetime(raw[column], format="%Y.%m.%d %H:%M:%S")
+
+    profits = trades["Profit/Loss"].to_numpy()
+    balances = trades["Balance"].to_numpy()
+    returns = to_returns(profits, balances)
+
+    # Each trade as a multiple of the amount actually risked. Dividing the
+    # observed fractional return by the risk level the export used recovers
+    # the outcome in units of risk, which can then be re-applied at any other
+    # level.
+    observed_risk = estimate_risk_level(raw)
+    risk_multiples = returns / observed_risk
+
+    benchmark = buy_and_hold_curve(prices_from_trades(raw), starting_balance)
+    span_years = (
+        trades["Close time"].iloc[-1] - trades["Open time"].iloc[0]
+    ).days / 365.25
+
+    return {
+        "risk_multiples": risk_multiples,
+        "observed_risk": observed_risk,
+        "starting_balance": starting_balance,
+        "benchmark": benchmark,
+        "periods_per_year": len(trades) / span_years,
+    }
+
+
+def estimate_risk_level(raw):
+    """
+    Recover the fraction of the account risked per trade from the export.
+
+    Trades closed at a stop loss lost close to the full amount risked, so the
+    typical such loss, expressed against the balance before it, gives the
+    risk level. The median is used rather than the mean because it is not
+    disturbed by the occasional trade that slipped beyond its stop.
+
+    The raw export is used rather than the cleaned trade table, because the
+    ingest stage discards the exit-reason column: it is not needed by the
+    simulation and is only required here.
+    """
+    stopped = raw[raw["Close type"] == "SL"]
+
+    if stopped.empty:
+        raise ValueError("No stop-loss exits found; cannot infer risk level")
+
+    balance_before = stopped["Balance"] - stopped["Profit/Loss"]
+    return float((-stopped["Profit/Loss"] / balance_before).median())
+
+
+def evaluate_at_risk(inputs, risk):
+    """Run the whole comparison with the strategy sized at the given risk."""
+    returns = inputs["risk_multiples"] * risk
+    starting_balance = inputs["starting_balance"]
+
+    actual = equity_curve(returns, starting_balance, compound=True)
+    paths = run_simulation(
+        returns, starting_balance,
+        n_simulations=N_SIMULATIONS, seed=SEED, compound=True,
+    )
+    comparison = compare_to_benchmark(
+        paths, inputs["benchmark"], starting_balance,
+        periods_per_year=inputs["periods_per_year"],
+    )
+
+    actual_return = float(total_return(actual, starting_balance))
+    actual_drawdown = float(max_drawdown(actual, starting_balance))
+
+    return {
+        "risk_per_trade": risk,
+        "actual_return": actual_return,
+        "actual_max_drawdown": actual_drawdown,
+        "actual_return_to_drawdown": float(
+            return_to_drawdown(actual_return, actual_drawdown)
+        ),
+        "p_beats_on_return": float(comparison["beats_on_return"].mean()),
+        "p_beats_on_ratio": float(comparison["beats_on_ratio"].mean()),
+        "p_beats_on_sharpe": float(comparison["beats_on_sharpe"].mean()),
+        "median_sim_return": float(np.median(comparison["path_returns"])),
+        "median_sim_drawdown": float(np.median(comparison["path_drawdowns"])),
+        "p95_sim_drawdown": float(np.percentile(comparison["path_drawdowns"], 95)),
+        "benchmark_return": comparison["benchmark_return"],
+        "benchmark_drawdown": comparison["benchmark_drawdown"],
+    }
+
+
+def plot_sensitivity(results, benchmark_return, benchmark_drawdown):
+    figure, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    risk_percent = results["risk_per_trade"] * 100
+
+    # Panel 1: does it beat the benchmark, on each criterion?
+    left = axes[0]
+    for label, column, colour in (
+        ("On return", "p_beats_on_return", "#b3541e"),
+        ("On return/drawdown", "p_beats_on_ratio", "#1f3d63"),
+        ("On Sharpe", "p_beats_on_sharpe", "#2e7d5b"),
+    ):
+        left.plot(risk_percent, results[column] * 100,
+                  marker="o", color=colour, label=label)
+    left.axhline(50, color="#999999", linestyle="--", linewidth=1)
+    left.axvline(BASELINE_RISK * 100, color="#333333", linestyle=":",
+                 linewidth=1.2, label="Primary case")
+    left.set_xlabel("Risk per trade (% of account)")
+    left.set_ylabel("Simulations beating benchmark (%)")
+    left.set_title("Does it beat buy and hold?")
+    left.legend(frameon=False, fontsize=8)
+    left.spines[["top", "right"]].set_visible(False)
+
+    # Panel 2: return, against the benchmark's.
+    middle = axes[1]
+    middle.plot(risk_percent, results["actual_return"] * 100,
+                marker="o", color="#1f3d63", label="Strategy")
+    middle.axhline(benchmark_return * 100, color="#b3541e", linestyle="--",
+                   linewidth=1.2, label="Buy and hold")
+    middle.axvline(BASELINE_RISK * 100, color="#333333", linestyle=":", linewidth=1.2)
+    middle.set_yscale("log")
+    middle.set_xlabel("Risk per trade (% of account)")
+    middle.set_ylabel("Total return (%)")
+    middle.set_title("Return")
+    middle.legend(frameon=False, fontsize=8)
+    middle.spines[["top", "right"]].set_visible(False)
+
+    # Panel 3: the cost of that return.
+    right = axes[2]
+    right.plot(risk_percent, results["actual_max_drawdown"] * 100,
+               marker="o", color="#1f3d63", label="Strategy (actual)")
+    right.plot(risk_percent, results["p95_sim_drawdown"] * 100,
+               marker="^", markersize=4, color="#8fa8c8", linestyle="-.",
+               label="Simulated 95th percentile")
+    right.axhline(benchmark_drawdown * 100, color="#b3541e", linestyle="--",
+                  linewidth=1.2, label="Buy and hold")
+    right.axvline(BASELINE_RISK * 100, color="#333333", linestyle=":", linewidth=1.2)
+    right.set_xlabel("Risk per trade (% of account)")
+    right.set_ylabel("Maximum drawdown (%)")
+    right.set_title("Risk taken")
+    right.legend(frameon=False, fontsize=8)
+    right.spines[["top", "right"]].set_visible(False)
+
+    figure.tight_layout()
+    figure.savefig(OUTPUT / "sensitivity.png", dpi=150)
+    print(f"\n  chart written to {OUTPUT / 'sensitivity.png'}")
+
+
+def main():
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+
+    inputs = load_inputs()
+    print("Position sizing sensitivity")
+    print(f"  risk level found in the export: {inputs['observed_risk']:.3%}")
+    print(f"  {N_SIMULATIONS:,} simulations at each level\n")
+
+    results = pd.DataFrame(
+        [evaluate_at_risk(inputs, risk) for risk in RISK_LEVELS]
+    )
+
+    benchmark_return = results["benchmark_return"].iloc[0]
+    benchmark_drawdown = results["benchmark_drawdown"].iloc[0]
+
+    print(f"  Benchmark: {benchmark_return:.1%} return, "
+          f"{benchmark_drawdown:.1%} maximum drawdown\n")
+    print("  risk    return    maxDD   ret/DD   P(beat return)  P(ret/DD)  P(Sharpe)")
+    print("  " + "-" * 72)
+    for _, row in results.iterrows():
+        print(
+            f"  {row['risk_per_trade']:>4.2%}  "
+            f"{row['actual_return']:>7.1%}  "
+            f"{row['actual_max_drawdown']:>6.1%}  "
+            f"{row['actual_return_to_drawdown']:>6.2f}  "
+            f"{row['p_beats_on_return']:>13.1%}  "
+            f"{row['p_beats_on_ratio']:>9.1%}  "
+            f"{row['p_beats_on_sharpe']:>9.1%}"
+        )
+
+    results.to_csv(OUTPUT / "sensitivity.csv", index=False)
+    plot_sensitivity(results, benchmark_return, benchmark_drawdown)
+
+    # Where, if anywhere, does the verdict on return change?
+    beats = results[results["p_beats_on_return"] > 0.5]
+    if beats.empty:
+        print(
+            "\n  At no tested risk level did the strategy beat the benchmark "
+            "on return in the majority of simulations."
+        )
+    else:
+        crossover = beats["risk_per_trade"].iloc[0]
+        print(
+            f"\n  The strategy first beats the benchmark on return in the "
+            f"majority of simulations at {crossover:.2%} risk per trade."
+        )
+
+    print(
+        "  Note that the Sharpe ratio is unchanged by sizing, since scaling "
+        "every return by the same factor scales mean and standard deviation "
+        "equally. Any variation shown is simulation noise."
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+Total: 2854 lines across 12 files.
+==============================================================================

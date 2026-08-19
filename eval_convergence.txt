@@ -1,0 +1,25 @@
+Convergence analysis
+  9 counts x 12 seeds
+  completed 100 simulations x 12 seeds
+  completed 250 simulations x 12 seeds
+  completed 500 simulations x 12 seeds
+  completed 1,000 simulations x 12 seeds
+  completed 2,500 simulations x 12 seeds
+  completed 5,000 simulations x 12 seeds
+  completed 10,000 simulations x 12 seeds
+  completed 25,000 simulations x 12 seeds
+  completed 50,000 simulations x 12 seeds
+  chart written to G:\Monte Carlo\MC\evaluation\results\convergence.png
+
+  n_sims   spread(return)  spread(ret/DD)  spread(Sharpe)   time
+      100          8.00%          9.00%          7.00%    0.00s
+      250          5.20%          6.40%          5.60%    0.01s
+      500          3.40%          4.60%          4.00%    0.01s
+    1,000          2.30%          3.80%          3.10%    0.03s
+    2,500          1.40%          2.80%          1.72%    0.08s
+    5,000          1.22%          1.78%          1.02%    0.13s
+   10,000          0.81%          1.58%          0.67%    0.30s
+   25,000          0.56%          1.04%          0.36%    0.75s
+   50,000          0.33%          0.30%          0.19%    1.49s
+
+  Recommended default: 50,000 simulations (1.49s per run)

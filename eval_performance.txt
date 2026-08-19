@@ -1,0 +1,31 @@
+Performance: scaling with simulation count
+    1,000 simulations:   0.01s,      18 MB
+    5,000 simulations:   0.04s,      88 MB
+   10,000 simulations:   0.09s,     177 MB
+   25,000 simulations:   0.22s,     442 MB
+   50,000 simulations:   0.43s,     883 MB
+  100,000 simulations:   0.97s,    1766 MB
+
+Performance: scaling with trade history length
+      100 trades:        0.01s,      24 MB
+      250 trades:        0.03s,      60 MB
+      500 trades:        0.08s,     120 MB
+      736 trades:        0.10s,     177 MB
+    1,500 trades:        0.18s,     360 MB
+    3,000 trades:        0.37s,     720 MB
+
+Performance: vectorised against a loop
+    1,000: vectorised   0.01s, loop   0.02s,   2.1x faster
+    5,000: vectorised   0.04s, loop   0.10s,   2.3x faster
+   10,000: vectorised   0.09s, loop   0.22s,   2.4x faster
+   25,000: vectorised   0.22s, loop   0.46s,   2.1x faster
+
+Performance: complete analysis
+   10,000 simulations:   0.34s,     295 MB
+   25,000 simulations:   0.72s,     737 MB
+   50,000 simulations:   1.52s,    1474 MB
+
+  chart written to G:\Monte Carlo\MC\evaluation\results\performance.png
+
+  Every configuration tested completed within the 10s interactive target.
+  Peak memory across all configurations: 1,766 MB

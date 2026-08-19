@@ -1,0 +1,21 @@
+Position sizing sensitivity
+  risk level found in the export: 1.013%
+  25,000 simulations at each level
+
+  Benchmark: 741.1% return, 43.9% maximum drawdown
+
+  risk    return    maxDD   ret/DD   P(beat return)  P(ret/DD)  P(Sharpe)
+  ------------------------------------------------------------------------
+  0.25%    50.2%    4.2%   11.91           0.0%      47.5%      95.7%
+  0.50%   123.9%    8.3%   14.98           0.0%      66.1%      95.7%
+  0.75%   231.6%   12.2%   19.00           0.0%      78.7%      95.7%
+  1.00%   387.6%   16.0%   24.29           4.9%      86.8%      95.7%
+  1.50%   933.2%   23.1%   40.42          66.5%      94.5%      95.7%
+  2.00%  2030.9%   29.7%   68.40          92.6%      97.5%      95.7%
+  3.00%  8266.2%   41.5%  199.41          99.2%      99.1%      95.7%
+  5.00%  94272.7%   60.0%  1572.05          99.9%      99.7%      95.7%
+
+  chart written to G:\Monte Carlo\MC\evaluation\results\sensitivity.png
+
+  The strategy first beats the benchmark on return in the majority of simulations at 1.50% risk per trade.
+  Note that the Sharpe ratio is unchanged by sizing, since scaling every return by the same factor scales mean and standard deviation equally. Any variation shown is simulation noise.
